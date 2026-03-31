@@ -15,11 +15,90 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthSource {
+    None,
+    ApiKey(String),
+    BearerToken(String),
+    ApiKeyAndBearer {
+        api_key: String,
+        bearer_token: String,
+    },
+}
+
+impl AuthSource {
+    pub fn from_env() -> Result<Self, ApiError> {
+        let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
+        let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?;
+        match (api_key, auth_token) {
+            (Some(api_key), Some(bearer_token)) => Ok(Self::ApiKeyAndBearer {
+                api_key,
+                bearer_token,
+            }),
+            (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
+            (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
+            (None, None) => Err(ApiError::MissingApiKey),
+        }
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey(api_key) | Self::ApiKeyAndBearer { api_key, .. } => Some(api_key),
+            Self::None | Self::BearerToken(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn bearer_token(&self) -> Option<&str> {
+        match self {
+            Self::BearerToken(token)
+            | Self::ApiKeyAndBearer {
+                bearer_token: token,
+                ..
+            } => Some(token),
+            Self::None | Self::ApiKey(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn masked_authorization_header(&self) -> &'static str {
+        if self.bearer_token().is_some() {
+            "Bearer [REDACTED]"
+        } else {
+            "<absent>"
+        }
+    }
+
+    pub fn apply(&self, mut request_builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(api_key) = self.api_key() {
+            request_builder = request_builder.header("x-api-key", api_key);
+        }
+        if let Some(token) = self.bearer_token() {
+            request_builder = request_builder.bearer_auth(token);
+        }
+        request_builder
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthTokenSet {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<u64>,
+    pub scopes: Vec<String>,
+}
+
+impl From<OAuthTokenSet> for AuthSource {
+    fn from(value: OAuthTokenSet) -> Self {
+        Self::BearerToken(value.access_token)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
-    api_key: String,
-    auth_token: Option<String>,
+    auth: AuthSource,
     base_url: String,
     max_retries: u32,
     initial_backoff: Duration,
@@ -31,8 +110,19 @@ impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: api_key.into(),
-            auth_token: None,
+            auth: AuthSource::ApiKey(api_key.into()),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
+
+    #[must_use]
+    pub fn from_auth(auth: AuthSource) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -41,14 +131,37 @@ impl AnthropicClient {
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
-        Ok(Self::new(read_api_key()?)
-            .with_auth_token(read_auth_token())
-            .with_base_url(read_base_url()))
+        Ok(Self::from_auth(AuthSource::from_env()?).with_base_url(read_base_url()))
+    }
+
+    #[must_use]
+    pub fn with_auth_source(mut self, auth: AuthSource) -> Self {
+        self.auth = auth;
+        self
     }
 
     #[must_use]
     pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
-        self.auth_token = auth_token.filter(|token| !token.is_empty());
+        match (
+            self.auth.api_key().map(ToOwned::to_owned),
+            auth_token.filter(|token| !token.is_empty()),
+        ) {
+            (Some(api_key), Some(bearer_token)) => {
+                self.auth = AuthSource::ApiKeyAndBearer {
+                    api_key,
+                    bearer_token,
+                };
+            }
+            (Some(api_key), None) => {
+                self.auth = AuthSource::ApiKey(api_key);
+            }
+            (None, Some(bearer_token)) => {
+                self.auth = AuthSource::BearerToken(bearer_token);
+            }
+            (None, None) => {
+                self.auth = AuthSource::None;
+            }
+        }
         self
     }
 
@@ -69,6 +182,11 @@ impl AnthropicClient {
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
         self
+    }
+
+    #[must_use]
+    pub fn auth_source(&self) -> &AuthSource {
+        &self.auth
     }
 
     pub async fn send_message(
@@ -151,28 +269,25 @@ impl AnthropicClient {
         let resolved_base_url = self.base_url.trim_end_matches('/');
         eprintln!("[anthropic-client] resolved_base_url={resolved_base_url}");
         eprintln!("[anthropic-client] request_url={request_url}");
-        let mut request_builder = self
+        let request_builder = self
             .http
             .post(&request_url)
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
+        let mut request_builder = self.auth.apply(request_builder);
 
-        let auth_header = self
-            .auth_token
-            .as_ref()
-            .map_or("<absent>", |_| "Bearer [REDACTED]");
-        eprintln!("[anthropic-client] headers x-api-key=[REDACTED] authorization={auth_header} anthropic-version={ANTHROPIC_VERSION} content-type=application/json");
+        eprintln!(
+            "[anthropic-client] headers x-api-key={} authorization={} anthropic-version={ANTHROPIC_VERSION} content-type=application/json",
+            if self.auth.api_key().is_some() {
+                "[REDACTED]"
+            } else {
+                "<absent>"
+            },
+            self.auth.masked_authorization_header()
+        );
 
-        if let Some(auth_token) = &self.auth_token {
-            request_builder = request_builder.bearer_auth(auth_token);
-        }
-
-        request_builder
-            .json(request)
-            .send()
-            .await
-            .map_err(ApiError::from)
+        request_builder = request_builder.json(request);
+        request_builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -189,24 +304,28 @@ impl AnthropicClient {
     }
 }
 
-fn read_api_key() -> Result<String, ApiError> {
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(api_key) if !api_key.is_empty() => Ok(api_key),
-        Ok(_) => Err(ApiError::MissingApiKey),
-        Err(std::env::VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
-            Ok(api_key) if !api_key.is_empty() => Ok(api_key),
-            Ok(_) | Err(std::env::VarError::NotPresent) => Err(ApiError::MissingApiKey),
-            Err(error) => Err(ApiError::from(error)),
-        },
+fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(ApiError::from(error)),
     }
 }
 
+#[cfg(test)]
+fn read_api_key() -> Result<String, ApiError> {
+    let auth = AuthSource::from_env()?;
+    auth.api_key()
+        .or_else(|| auth.bearer_token())
+        .map(ToOwned::to_owned)
+        .ok_or(ApiError::MissingApiKey)
+}
+
+#[cfg(test)]
 fn read_auth_token() -> Option<String> {
-    match std::env::var("ANTHROPIC_AUTH_TOKEN") {
-        Ok(token) if !token.is_empty() => Some(token),
-        _ => None,
-    }
+    read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+        .ok()
+        .and_then(std::convert::identity)
 }
 
 fn read_base_url() -> String {
@@ -308,14 +427,14 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
+    use crate::client::{AuthSource, OAuthTokenSet};
     use crate::types::{ContentBlockDelta, MessageRequest};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("env lock should not be poisoned")
+            .expect("env lock")
     }
 
     #[test]
@@ -355,6 +474,30 @@ mod tests {
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    }
+
+    #[test]
+    fn oauth_token_maps_to_bearer_auth_source() {
+        let auth = AuthSource::from(OAuthTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(123),
+            scopes: vec!["scope:a".to_string()],
+        });
+        assert_eq!(auth.bearer_token(), Some("access-token"));
+        assert_eq!(auth.api_key(), None);
+    }
+
+    #[test]
+    fn auth_source_from_env_combines_api_key_and_bearer_token() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
+        std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
+        let auth = AuthSource::from_env().expect("env auth");
+        assert_eq!(auth.api_key(), Some("legacy-key"));
+        assert_eq!(auth.bearer_token(), Some("auth-token"));
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
@@ -434,6 +577,27 @@ mod tests {
         assert_eq!(
             super::request_id_from_headers(&headers).as_deref(),
             Some("req_fallback")
+        );
+    }
+
+    #[test]
+    fn auth_source_applies_headers() {
+        let auth = AuthSource::ApiKeyAndBearer {
+            api_key: "test-key".to_string(),
+            bearer_token: "proxy-token".to_string(),
+        };
+        let request = auth
+            .apply(reqwest::Client::new().post("https://example.test"))
+            .build()
+            .expect("request build");
+        let headers = request.headers();
+        assert_eq!(
+            headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("test-key")
+        );
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer proxy-token")
         );
     }
 }

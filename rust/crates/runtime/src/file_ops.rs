@@ -285,7 +285,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .output_mode
         .clone()
         .unwrap_or_else(|| String::from("files_with_matches"));
-    let context_window = input.context.or(input.context_short).unwrap_or(0);
+    let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
     let mut content_lines = Vec::new();
@@ -325,8 +325,8 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         filenames.push(file_path.to_string_lossy().into_owned());
         if output_mode == "content" {
             for index in matched_lines {
-                let start = index.saturating_sub(input.before.unwrap_or(context_window));
-                let end = (index + input.after.unwrap_or(context_window) + 1).min(lines.len());
+                let start = index.saturating_sub(input.before.unwrap_or(context));
+                let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
                 for (current, line_content) in lines.iter().enumerate().take(end).skip(start) {
                     let prefix = if input.line_numbers.unwrap_or(true) {
                         format!("{}:{}:", file_path.to_string_lossy(), current + 1)
@@ -341,7 +341,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let content = if output_mode == "content" {
+    let rendered_content = if output_mode == "content" {
         let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
         return Ok(GrepSearchOutput {
             mode: Some(output_mode),
@@ -361,7 +361,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
-        content,
+        content: rendered_content,
         num_lines: None,
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,

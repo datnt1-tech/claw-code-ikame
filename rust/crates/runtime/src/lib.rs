@@ -5,8 +5,12 @@ mod config;
 mod conversation;
 mod file_ops;
 mod json;
+mod mcp;
+mod mcp_client;
+mod oauth;
 mod permissions;
 mod prompt;
+mod remote;
 mod session;
 mod usage;
 
@@ -17,8 +21,10 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, RuntimeConfig,
-    CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
+    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpClaudeAiProxyServerConfig,
+    McpConfigCollection, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    RuntimeConfig, RuntimeFeatureConfig, ScopedMcpServerConfig, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
@@ -29,6 +35,19 @@ pub use file_ops::{
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
 };
+pub use mcp::{
+    mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
+    scoped_mcp_config_hash, unwrap_ccr_proxy_url,
+};
+pub use mcp_client::{
+    McpClaudeAiProxyTransport, McpClientAuth, McpClientBootstrap, McpClientTransport,
+    McpRemoteTransport, McpSdkTransport, McpStdioTransport,
+};
+pub use oauth::{
+    code_challenge_s256, generate_pkce_pair, generate_state, loopback_redirect_uri,
+    OAuthAuthorizationRequest, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
+    PkceChallengeMethod, PkceCodePair,
+};
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
     PermissionPrompter, PermissionRequest,
@@ -36,6 +55,11 @@ pub use permissions::{
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
     SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+};
+pub use remote::{
+    inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
+    RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
+    DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
 pub use usage::{
