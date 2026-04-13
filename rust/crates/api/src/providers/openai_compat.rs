@@ -724,12 +724,17 @@ struct OpenAiUsage {
 impl OpenAiUsage {
     fn cached_input_tokens(&self) -> u32 {
         self.prompt_cache_hit_tokens
-            .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+            })
             .unwrap_or(0)
     }
 
     fn uncached_input_tokens(&self) -> u32 {
-        self.prompt_tokens.saturating_sub(self.cached_input_tokens())
+        self.prompt_tokens
+            .saturating_sub(self.cached_input_tokens())
     }
 }
 

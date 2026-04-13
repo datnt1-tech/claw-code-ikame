@@ -24,11 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model,
-    resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model, model_token_limit,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -3163,6 +3163,29 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Collapse `$HOME` in a path to `~` for display.
+fn shorten_home_path(path: &Path) -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    let home = PathBuf::from(home);
+    match path.strip_prefix(&home) {
+        Ok(stripped) if stripped.as_os_str().is_empty() => "~".to_string(),
+        Ok(stripped) => format!("~/{}", stripped.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Fish-style REPL prompt: a rectangular green badge with the current working
+/// directory (Nerd Font folder glyph + `~`-shortened path). Assumes a Nerd
+/// Font is active in the terminal; the folder glyph falls back to a tofu
+/// box without one.
+fn build_repl_prompt() -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let display = shorten_home_path(&cwd);
+    format!("\x1b[1;38;2;33;37;41;48;2;46;164;79m \u{f07b} {display}\x1b[0m ")
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
@@ -3176,13 +3199,16 @@ fn run_repl(
     run_stale_base_preflight(base_commit.as_deref());
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        build_repl_prompt(),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        editor.set_prompt(build_repl_prompt());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -3213,12 +3239,12 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    cli.run_turn_interactive(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.run_turn_interactive(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -3794,13 +3820,13 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[38;5;208m\
+██╗██╗  ██╗  ██████╗██╗      █████╗ ██╗    ██╗\n\
+██║██║ ██╔╝ ██╔════╝██║     ██╔══██╗██║    ██║\n\
+██║█████╔╝  ██║     ██║     ███████║██║ █╗ ██║\n\
+██║██╔═██╗  ██║     ██║     ██╔══██║██║███╗██║\n\
+██║██║  ██╗ ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
+╚═╝╚═╝  ╚═╝  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCODE\x1b[0m 🔥\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -3860,10 +3886,8 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let spinner = ThinkingSpinner::start(
-            "🦀 Thinking...",
-            *TerminalRenderer::new().color_theme(),
-        );
+        let spinner =
+            ThinkingSpinner::start("🔥 Thinking...", *TerminalRenderer::new().color_theme());
         if let Some(spinner) = spinner.as_ref() {
             runtime
                 .api_client_mut()
@@ -3890,6 +3914,13 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                if error.to_string().contains("turn cancelled by user") {
+                    if let Some(spinner) = spinner {
+                        spinner.finish_failure("🛑 Cancelled");
+                    }
+                    println!("\n\x1b[1;33m⚠️  Turn cancelled — partial progress discarded\x1b[0m");
+                    return Ok(());
+                }
                 if let Some(spinner) = spinner {
                     spinner.finish_failure("❌ Request failed");
                 }
@@ -4364,11 +4395,7 @@ impl LiveCli {
         let tracker = self.runtime.usage();
         println!(
             "{}",
-            format_usage_report(
-                tracker.cumulative_usage(),
-                tracker.turns(),
-                &self.model,
-            )
+            format_usage_report(tracker.cumulative_usage(), tracker.turns(), &self.model,)
         );
     }
 
@@ -4706,6 +4733,94 @@ impl LiveCli {
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
+    }
+
+    /// REPL entrypoint that wraps [`Self::run_turn`] with preemptive compaction
+    /// (Layer 3), catch-and-continue error handling (Layer 1), and an inline
+    /// recovery prompt when the provider rejects the request for exceeding the
+    /// context window (Layer 2). All user-visible errors are printed here so
+    /// the caller can ignore the `Err` path and keep the REPL running.
+    fn run_turn_interactive(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.maybe_auto_compact();
+        match self.run_turn(input) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let err_ref: &(dyn std::error::Error + 'static) = error.as_ref();
+                if is_context_window_blocked(err_ref) {
+                    eprintln!("{error}");
+                    self.handle_context_window_recovery(input)
+                } else {
+                    eprintln!("{error}");
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn maybe_auto_compact(&mut self) {
+        let Some(limit) = model_token_limit(&self.model) else {
+            return;
+        };
+        if limit.context_window_tokens == 0 {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let window = f64::from(limit.context_window_tokens);
+        #[allow(clippy::cast_precision_loss)]
+        let estimated = self.runtime.estimated_tokens() as f64;
+        let ratio = estimated / window;
+        let threshold = f64::from(load_auto_compact_threshold());
+        if ratio < threshold {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let percent = (ratio * 100.0).round() as u32;
+        println!(
+            "🧹 Auto-compacting session ({percent}% of {window_int}-token context window)",
+            window_int = limit.context_window_tokens,
+        );
+        if let Err(error) = self.compact() {
+            eprintln!("warning: auto-compact failed: {error}");
+        }
+    }
+
+    fn handle_context_window_recovery(
+        &mut self,
+        input: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        loop {
+            print!("\nRecovery: [c]ompact & retry / [r]etry / [n]ew session / [q]uit prompt > ");
+            std::io::stdout().flush().ok();
+            let mut choice = String::new();
+            if std::io::stdin().read_line(&mut choice).is_err() {
+                return Ok(());
+            }
+            let trimmed = choice.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "c" | "compact" | "" => {
+                    self.compact()?;
+                    if let Err(error) = self.run_turn(input) {
+                        eprintln!("{error}");
+                    }
+                    return Ok(());
+                }
+                "r" | "retry" => {
+                    if let Err(error) = self.run_turn(input) {
+                        eprintln!("{error}");
+                    }
+                    return Ok(());
+                }
+                "n" | "new" => {
+                    self.clear_session(true)?;
+                    return Ok(());
+                }
+                "q" | "quit" => return Ok(()),
+                _ => {
+                    eprintln!("Unknown choice '{trimmed}'. Use c / r / n / q.");
+                }
+            }
+        }
     }
 
     fn run_internal_prompt_text_with_progress(
@@ -7038,6 +7153,9 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut pending_text_buf = String::new();
+        let mut last_text_flush = Instant::now();
+        const TEXT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -7092,9 +7210,16 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                pending_text_buf.push_str(&rendered);
+                                if pending_text_buf.contains('\n')
+                                    || last_text_flush.elapsed() >= TEXT_FLUSH_INTERVAL
+                                {
+                                    write!(out, "{pending_text_buf}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    pending_text_buf.clear();
+                                    last_text_flush = Instant::now();
+                                }
                             }
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -7114,6 +7239,13 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
+                    if !pending_text_buf.is_empty() {
+                        write!(out, "{pending_text_buf}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        pending_text_buf.clear();
+                        last_text_flush = Instant::now();
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
@@ -7141,6 +7273,12 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
+                    if !pending_text_buf.is_empty() {
+                        write!(out, "{pending_text_buf}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        pending_text_buf.clear();
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
@@ -7155,6 +7293,13 @@ impl AnthropicRuntimeClient {
                     events.push(AssistantEvent::MessageStop);
                 }
             }
+        }
+
+        if !pending_text_buf.is_empty() {
+            write!(out, "{pending_text_buf}")
+                .and_then(|()| out.flush())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            pending_text_buf.clear();
         }
 
         push_prompt_cache_record(&self.client, &mut events);
@@ -7198,6 +7343,42 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .messages
         .last()
         .is_some_and(|message| message.role == MessageRole::Tool)
+}
+
+/// Returns true when the error carries the header emitted by
+/// [`format_context_window_blocked_error`]. Detection is string-based because
+/// context-window failures are flattened into `RuntimeError`'s opaque message
+/// before reaching the REPL — the header is the only reliable signal.
+fn is_context_window_blocked(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.to_string().contains("Context window blocked")
+}
+
+/// Ratio of the model's context window at which the interactive REPL
+/// preemptively compacts the session. Overridable via
+/// `auto_compact_threshold_percent` (integer 1..=100) in `~/.claw.json` or any
+/// merged claw config; values outside that range fall back to the default.
+fn load_auto_compact_threshold() -> f32 {
+    const DEFAULT_THRESHOLD: f32 = 0.8;
+    let Ok(cwd) = env::current_dir() else {
+        return DEFAULT_THRESHOLD;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else {
+        return DEFAULT_THRESHOLD;
+    };
+    let Some(raw) = config
+        .get("auto_compact_threshold_percent")
+        .and_then(|value| value.as_i64())
+    else {
+        return DEFAULT_THRESHOLD;
+    };
+    if (1..=100).contains(&raw) {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = raw as f32 / 100.0;
+        ratio
+    } else {
+        DEFAULT_THRESHOLD
+    }
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -7565,11 +7746,23 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
-    let detail = match name {
-        "bash" | "Bash" => format_bash_call(&parsed),
+    let mut extra_lines: Option<String> = None;
+    let (display_name, detail) = match name {
+        "bash" | "Bash" => {
+            let command = parsed
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let body = if command.is_empty() {
+                String::new()
+            } else {
+                format!("$ {}", truncate_for_summary(command, 160))
+            };
+            ("bash", body)
+        }
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            ("read_file", format!("📄 {path}"))
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -7577,7 +7770,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+            ("write_file", format!("✏️ {path} ({lines} lines)"))
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -7591,27 +7784,45 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .or_else(|| parsed.get("newString"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
-                format_patch_preview(old_value, new_value, &path)
-                    .map(|preview| format!("\n{preview}"))
-                    .unwrap_or_default()
-            )
+            extra_lines = format_patch_preview(old_value, new_value, &path);
+            ("edit_file", format!("📝 {path}"))
         }
-        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
-        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
-        "web_search" | "WebSearch" => parsed
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?")
-            .to_string(),
-        _ => summarize_tool_payload(input),
+        "glob_search" | "Glob" => ("glob_search", format_search_inline("🔎 Glob", &parsed)),
+        "grep_search" | "Grep" => ("grep_search", format_search_inline("🔎 Grep", &parsed)),
+        "web_search" | "WebSearch" => {
+            let query = parsed
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            ("web_search", format!("🔎 {query}"))
+        }
+        other => (other, summarize_tool_payload(input)),
     };
 
-    let border = "─".repeat(name.len() + 8);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    )
+    let mut line = if detail.is_empty() {
+        format!("\x1b[1;38;2;33;37;41;48;2;46;164;79m {display_name} \x1b[0m")
+    } else {
+        format!(
+            "\x1b[1;38;2;33;37;41;48;2;46;164;79m {display_name} \x1b[0m \x1b[97m{detail}\x1b[0m"
+        )
+    };
+    if let Some(preview) = extra_lines {
+        line.push('\n');
+        line.push_str(&preview);
+    }
+    line
+}
+
+fn format_search_inline(label: &str, parsed: &serde_json::Value) -> String {
+    let pattern = parsed
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let scope = parsed
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or(".");
+    format!("{label} {pattern} (in {scope})")
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
@@ -7657,18 +7868,6 @@ fn extract_tool_path(parsed: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("?")
         .to_string()
-}
-
-fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
-    let pattern = parsed
-        .get("pattern")
-        .and_then(|value| value.as_str())
-        .unwrap_or("?");
-    let scope = parsed
-        .get("path")
-        .and_then(|value| value.as_str())
-        .unwrap_or(".");
-    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
 const DIFF_REMOVED_BG: &str = "\x1b[48;5;52m";
@@ -7726,10 +7925,7 @@ fn highlight_diff_line(line: &str, marker: char, bg: &str, language: &str) -> St
         code.push('\n');
         let highlighted = diff_renderer().highlight_code(&code, language);
         highlighted
-            .replace(
-                DIFF_CODE_BLOCK_BG_RESET,
-                &format!("{DIFF_ANSI_RESET}{bg}"),
-            )
+            .replace(DIFF_CODE_BLOCK_BG_RESET, &format!("{DIFF_ANSI_RESET}{bg}"))
             .replace(DIFF_CODE_BLOCK_BG, bg)
             .trim_end_matches('\n')
             .trim_end_matches(DIFF_ANSI_RESET)
@@ -7768,21 +7964,6 @@ fn format_patch_preview(old_value: &str, new_value: &str, path: &str) -> Option<
         rendered.push("\x1b[2m… diff truncated\x1b[0m".to_string());
     }
     Some(rendered.join("\n"))
-}
-
-fn format_bash_call(parsed: &serde_json::Value) -> String {
-    let command = parsed
-        .get("command")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if command.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\x1b[48;5;236;38;5;255m $ {} \x1b[0m",
-            truncate_for_summary(command, 160)
-        )
-    }
 }
 
 fn first_visible_line(text: &str) -> &str {
@@ -8295,8 +8476,8 @@ impl CliToolExecutor {
     }
 }
 
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+impl CliToolExecutor {
+    fn dispatch(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -8308,7 +8489,7 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -8316,27 +8497,58 @@ impl ToolExecutor for CliToolExecutor {
             self.tool_registry
                 .execute(tool_name, &value)
                 .map_err(ToolError::new)
-        };
-        match result {
-            Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
-                }
-                Ok(output)
-            }
-            Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                }
-                Err(error)
-            }
         }
+    }
+
+    fn emit_tool_output(&self, tool_name: &str, output: &str, is_error: bool) {
+        if !self.emit_output {
+            return;
+        }
+        let markdown = format_tool_result(tool_name, output, is_error);
+        let _ = self.renderer.stream_markdown(&markdown, &mut io::stdout());
+    }
+}
+
+/// Tools whose execution is purely read-only (no FS mutation, no arbitrary
+/// subprocess). Parallel batches are only dispatched when every tool in the
+/// batch is listed here.
+fn is_read_only_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Read"
+            | "read_file"
+            | "Grep"
+            | "grep_search"
+            | "Glob"
+            | "glob_search"
+            | "WebFetch"
+            | "WebSearch"
+            | "ToolSearch"
+            | "ListMcpResourcesTool"
+            | "ReadMcpResourceTool"
+    )
+}
+
+impl ToolExecutor for CliToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let result = self.dispatch(tool_name, input);
+        match &result {
+            Ok(output) => self.emit_tool_output(tool_name, output, false),
+            Err(error) => self.emit_tool_output(tool_name, &error.to_string(), true),
+        }
+        result
+    }
+
+    fn is_parallelizable(&self, tool_name: &str) -> bool {
+        is_read_only_tool_name(tool_name)
+    }
+
+    fn execute_shared(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.dispatch(tool_name, input)
+    }
+
+    fn emit_result(&self, tool_name: &str, output: &str, is_error: bool) {
+        self.emit_tool_output(tool_name, output, is_error);
     }
 }
 
@@ -8568,12 +8780,11 @@ mod tests {
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_usage_report,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
+        format_unknown_slash_command_message, format_usage_report, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
@@ -12087,11 +12298,19 @@ mod sandbox_report_tests {
             notifier: Some(notifier),
         };
         writer.write_all(b"").expect("empty write ok");
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "empty write must not fire");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "empty write must not fire"
+        );
         writer.write_all(b"hello").expect("first real write ok");
         assert_eq!(counter.load(Ordering::SeqCst), 1, "first write must fire");
         writer.write_all(b"world").expect("second write ok");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "callback must not fire twice");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "callback must not fire twice"
+        );
         drop(writer);
         assert_eq!(&sink, b"helloworld", "all bytes must pass through");
     }

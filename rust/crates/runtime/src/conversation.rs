@@ -57,6 +57,28 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    /// Returns `true` when the executor can safely run this tool concurrently
+    /// from a shared reference (`&self`) without mutating externally visible
+    /// state. Default: `false` (conservative — sequential only).
+    fn is_parallelizable(&self, _tool_name: &str) -> bool {
+        false
+    }
+
+    /// Shared-reference execution path used for parallel batches of
+    /// read-only tools. Default falls back to an error; parallelizable
+    /// executors override this. Implementations MUST NOT write to stdout —
+    /// the caller invokes `emit_result` afterwards in the original tool order.
+    fn execute_shared(&self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+        Err(ToolError::new(
+            "tool does not support shared-reference execution",
+        ))
+    }
+
+    /// Emit the UI-visible rendering of a finished tool result. Called by
+    /// the parallel batch path after `execute_shared` returns, preserving
+    /// the original tool order. Default: no-op.
+    fn emit_result(&self, _tool_name: &str, _output: &str, _is_error: bool) {}
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -122,6 +144,74 @@ pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
 }
 
+/// Safety switch: set `CLAW_DISABLE_PARALLEL_TOOLS=1` to force the sequential
+/// tool loop, skipping the parallel read-only fast path. Useful when a
+/// plugin/tool interacts badly with concurrent `&self` invocations.
+fn parallel_tools_disabled() -> bool {
+    std::env::var("CLAW_DISABLE_PARALLEL_TOOLS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+}
+
+/// Cap on simultaneously running tool threads. Larger batches are dispatched
+/// in chunks of this size so nested threadpools inside individual tools
+/// (ripgrep, etc.) don't explode into N*M workers.
+const MAX_PARALLEL_TOOL_THREADS: usize = 4;
+
+/// Verify the parallel batch output matches the prepared entries 1:1, log a
+/// one-line summary, and return the outputs unchanged for Phase C.
+fn verify_and_merge_batch_outputs(
+    batch: &[BatchToolEntry],
+    outputs: Vec<Option<Result<String, ToolError>>>,
+) -> Result<Vec<Option<Result<String, ToolError>>>, RuntimeError> {
+    if outputs.len() != batch.len() {
+        return Err(RuntimeError::new(format!(
+            "parallel batch structural drift: {} entries but {} outputs",
+            batch.len(),
+            outputs.len(),
+        )));
+    }
+
+    let mut failures = 0usize;
+    let mut panics = 0usize;
+    for (entry, slot) in batch.iter().zip(outputs.iter()) {
+        match (&entry.permission_outcome, slot) {
+            (PermissionOutcome::Allow, None) => {
+                return Err(RuntimeError::new(format!(
+                    "parallel batch: allowed tool `{}` missing output",
+                    entry.tool_name,
+                )));
+            }
+            (PermissionOutcome::Allow, Some(Err(error))) => {
+                failures += 1;
+                if error.to_string() == "tool thread panicked" {
+                    panics += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if panics > 0 {
+        eprintln!(
+            "warning: {panics} tool thread(s) panicked in parallel batch of {}",
+            batch.len()
+        );
+    }
+    let _ = failures;
+    Ok(outputs)
+}
+
+/// Per-tool work item captured sequentially in Phase A of the parallel
+/// batch path. Holds the pre-hook result and the final permission outcome
+/// so the thread pool only needs to run `execute_shared` in Phase B.
+struct BatchToolEntry {
+    tool_use_id: String,
+    tool_name: String,
+    effective_input: String,
+    pre_hook_result: HookRunResult,
+    permission_outcome: PermissionOutcome,
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -141,7 +231,7 @@ pub struct ConversationRuntime<C, T> {
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
-    T: ToolExecutor,
+    T: ToolExecutor + Sync,
 {
     #[must_use]
     pub fn new(
@@ -219,6 +309,67 @@ where
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
         self
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_parallel_batch(
+        &mut self,
+        pending: &mut Vec<(String, String, String)>,
+        iterations: usize,
+    ) -> Result<Vec<BatchToolEntry>, RuntimeError> {
+        let mut batch = Vec::with_capacity(pending.len());
+        for (tool_use_id, tool_name, input) in pending.drain(..) {
+            if self.hook_abort_signal.is_aborted() {
+                let error = RuntimeError::new("turn cancelled by user (Ctrl+C)");
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+            let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+            let effective_input = pre_hook_result
+                .updated_input()
+                .map_or_else(|| input.clone(), ToOwned::to_owned);
+            let permission_context = PermissionContext::new(
+                pre_hook_result.permission_override(),
+                pre_hook_result.permission_reason().map(ToOwned::to_owned),
+            );
+            let permission_outcome = if pre_hook_result.is_cancelled() {
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(
+                        &pre_hook_result,
+                        &format!("PreToolUse hook cancelled tool `{tool_name}`"),
+                    ),
+                }
+            } else if pre_hook_result.is_failed() {
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(
+                        &pre_hook_result,
+                        &format!("PreToolUse hook failed for tool `{tool_name}`"),
+                    ),
+                }
+            } else if pre_hook_result.is_denied() {
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(
+                        &pre_hook_result,
+                        &format!("PreToolUse hook denied tool `{tool_name}`"),
+                    ),
+                }
+            } else {
+                self.permission_policy.authorize_with_context(
+                    &tool_name,
+                    &effective_input,
+                    &permission_context,
+                    None,
+                )
+            };
+            batch.push(BatchToolEntry {
+                tool_use_id,
+                tool_name,
+                effective_input,
+                pre_hook_result,
+                permission_outcome,
+            });
+        }
+        Ok(batch)
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -349,6 +500,12 @@ where
                 return Err(error);
             }
 
+            if self.hook_abort_signal.is_aborted() {
+                let error = RuntimeError::new("turn cancelled by user (Ctrl+C)");
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -372,7 +529,7 @@ where
                 self.usage_tracker.record(usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
-            let pending_tool_uses = assistant_message
+            let mut pending_tool_uses = assistant_message
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
@@ -397,7 +554,140 @@ where
                 break;
             }
 
+            let parallel_candidate = prompter.is_none()
+                && !parallel_tools_disabled()
+                && pending_tool_uses.len() >= 2
+                && pending_tool_uses
+                    .iter()
+                    .all(|(_, name, _)| self.tool_executor.is_parallelizable(name));
+
+            if parallel_candidate {
+                let batch =
+                    self.prepare_parallel_batch(&mut pending_tool_uses, iterations)?;
+                // Phase B1 — dispatch: chunk the batch so at most
+                // `MAX_PARALLEL_TOOL_THREADS` threads run concurrently,
+                // preventing nested-threadpool thrashing (e.g. ripgrep).
+                let raw_outputs: Vec<Option<Result<String, ToolError>>> = {
+                    let executor = &self.tool_executor;
+                    let mut collected = Vec::with_capacity(batch.len());
+                    for chunk in batch.chunks(MAX_PARALLEL_TOOL_THREADS) {
+                        let chunk_outputs = std::thread::scope(|scope| {
+                            let handles: Vec<_> = chunk
+                                .iter()
+                                .map(|entry| {
+                                    let name = entry.tool_name.clone();
+                                    let input = entry.effective_input.clone();
+                                    let allow = matches!(
+                                        entry.permission_outcome,
+                                        PermissionOutcome::Allow,
+                                    );
+                                    scope.spawn(move || {
+                                        if allow {
+                                            Some(executor.execute_shared(&name, &input))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| {
+                                    h.join().unwrap_or_else(|_| {
+                                        Some(Err(ToolError::new("tool thread panicked")))
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        collected.extend(chunk_outputs);
+                    }
+                    collected
+                };
+
+                // Phase B2 — verify & merge: ensure every entry has a slot
+                // (even Deny-ed ones carry `None`), count failures for a
+                // one-line batch summary, and reject on structural drift.
+                let outputs = verify_and_merge_batch_outputs(&batch, raw_outputs)?;
+
+                for (entry, maybe_result) in batch.into_iter().zip(outputs) {
+                    let BatchToolEntry {
+                        tool_use_id,
+                        tool_name,
+                        effective_input,
+                        pre_hook_result,
+                        permission_outcome,
+                    } = entry;
+                    let result_message = match permission_outcome {
+                        PermissionOutcome::Allow => {
+                            self.record_tool_started(iterations, &tool_name);
+                            let exec_result = maybe_result
+                                .expect("Allow entries should have an execution result");
+                            let (mut output, mut is_error) = match exec_result {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            };
+                            self.tool_executor.emit_result(&tool_name, &output, is_error);
+                            output = merge_hook_feedback(
+                                pre_hook_result.messages(),
+                                output,
+                                false,
+                            );
+                            let post_hook_result = if is_error {
+                                self.run_post_tool_use_failure_hook(
+                                    &tool_name,
+                                    &effective_input,
+                                    &output,
+                                )
+                            } else {
+                                self.run_post_tool_use_hook(
+                                    &tool_name,
+                                    &effective_input,
+                                    &output,
+                                    false,
+                                )
+                            };
+                            if post_hook_result.is_denied()
+                                || post_hook_result.is_failed()
+                                || post_hook_result.is_cancelled()
+                            {
+                                is_error = true;
+                            }
+                            output = merge_hook_feedback(
+                                post_hook_result.messages(),
+                                output,
+                                post_hook_result.is_denied()
+                                    || post_hook_result.is_failed()
+                                    || post_hook_result.is_cancelled(),
+                            );
+                            ConversationMessage::tool_result(
+                                tool_use_id,
+                                tool_name,
+                                output,
+                                is_error,
+                            )
+                        }
+                        PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                            true,
+                        ),
+                    };
+                    self.session
+                        .push_message(result_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_tool_finished(iterations, &result_message);
+                    tool_results.push(result_message);
+                }
+                continue;
+            }
+
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                if self.hook_abort_signal.is_aborted() {
+                    let error = RuntimeError::new("turn cancelled by user (Ctrl+C)");
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -786,7 +1076,7 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
-type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
+type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError> + Send + Sync>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
 #[derive(Default)]
@@ -804,7 +1094,7 @@ impl StaticToolExecutor {
     pub fn register(
         mut self,
         tool_name: impl Into<String>,
-        handler: impl FnMut(&str) -> Result<String, ToolError> + 'static,
+        handler: impl FnMut(&str) -> Result<String, ToolError> + Send + Sync + 'static,
     ) -> Self {
         self.handlers.insert(tool_name.into(), Box::new(handler));
         self

@@ -22,7 +22,7 @@ pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, Au
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, ProviderKind,
+    model_token_limit, resolve_model_alias, ModelTokenLimit, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

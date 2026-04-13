@@ -157,11 +157,7 @@ impl ThinkingSpinner {
             let mut stdout = io::stdout();
             loop {
                 if state_thread.output_started.load(Ordering::Acquire) {
-                    let _ = execute!(
-                        stdout,
-                        MoveToColumn(0),
-                        Clear(ClearType::CurrentLine),
-                    );
+                    let _ = execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine),);
                     let _ = stdout.flush();
                     state_thread.cleared.store(true, Ordering::Release);
                     return;
