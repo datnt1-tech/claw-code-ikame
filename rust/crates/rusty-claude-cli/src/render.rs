@@ -1,5 +1,9 @@
 use std::fmt::Write as FmtWrite;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -112,6 +116,159 @@ impl Spinner {
             ResetColor
         )?;
         out.flush()
+    }
+}
+
+/// Background-thread spinner that keeps animating while a turn is
+/// "thinking" (no visible output yet). Stops cleanly the moment the
+/// streaming layer is about to write its first byte — the consumer
+/// must gate its first write on [`Self::notifier`] so the bg thread
+/// has time to clear its line before streamed content is rendered.
+pub struct ThinkingSpinner {
+    state: Arc<ThinkingSpinnerState>,
+    handle: Option<JoinHandle<()>>,
+    theme: ColorTheme,
+}
+
+struct ThinkingSpinnerState {
+    stop: AtomicBool,
+    output_started: AtomicBool,
+    cleared: AtomicBool,
+}
+
+impl ThinkingSpinner {
+    /// Start the spinner on a background thread. Returns `None` when
+    /// stdout is not a TTY (piped/scripted invocations stay clean) so
+    /// the caller can skip both the spinner and its notifier.
+    pub fn start(label: impl Into<String>, theme: ColorTheme) -> Option<Self> {
+        if !io::stdout().is_terminal() {
+            return None;
+        }
+        let state = Arc::new(ThinkingSpinnerState {
+            stop: AtomicBool::new(false),
+            output_started: AtomicBool::new(false),
+            cleared: AtomicBool::new(false),
+        });
+        let label = label.into();
+        let state_thread = Arc::clone(&state);
+        let theme_thread = theme;
+        let handle = thread::spawn(move || {
+            let mut frame_index = 0usize;
+            let mut stdout = io::stdout();
+            loop {
+                if state_thread.output_started.load(Ordering::Acquire) {
+                    let _ = execute!(
+                        stdout,
+                        MoveToColumn(0),
+                        Clear(ClearType::CurrentLine),
+                    );
+                    let _ = stdout.flush();
+                    state_thread.cleared.store(true, Ordering::Release);
+                    return;
+                }
+                if state_thread.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let frame = Spinner::FRAMES[frame_index % Spinner::FRAMES.len()];
+                frame_index += 1;
+                let _ = queue!(
+                    stdout,
+                    SavePosition,
+                    MoveToColumn(0),
+                    Clear(ClearType::CurrentLine),
+                    SetForegroundColor(theme_thread.spinner_active),
+                    Print(format!("{frame} {label}")),
+                    ResetColor,
+                    RestorePosition
+                );
+                let _ = stdout.flush();
+                thread::sleep(Duration::from_millis(80));
+            }
+        });
+        Some(Self {
+            state,
+            handle: Some(handle),
+            theme,
+        })
+    }
+
+    /// Produce a callback the streaming layer MUST invoke once, right
+    /// before its first visible byte hits stdout. The closure flips
+    /// `output_started` and blocks (briefly) until the bg thread has
+    /// cleared its line — preventing spinner/text from racing.
+    pub fn notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let state = Arc::clone(&self.state);
+        Arc::new(move || {
+            state.output_started.store(true, Ordering::Release);
+            while !state.cleared.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    fn stop_thread(&mut self) {
+        self.state.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Finish with success marker. If streaming never fired the
+    /// notifier, the spinner line is still present — clear it before
+    /// printing the marker. Otherwise streamed output is already on
+    /// screen ending in a newline; just append the marker.
+    pub fn finish_success(mut self, label: &str) {
+        let was_notified = self.state.output_started.load(Ordering::Acquire);
+        self.stop_thread();
+        let mut stdout = io::stdout();
+        let _ = if was_notified {
+            execute!(
+                stdout,
+                SetForegroundColor(self.theme.spinner_done),
+                Print(format!("✔ {label}\n")),
+                ResetColor
+            )
+        } else {
+            execute!(
+                stdout,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                SetForegroundColor(self.theme.spinner_done),
+                Print(format!("✔ {label}\n")),
+                ResetColor
+            )
+        };
+        let _ = stdout.flush();
+    }
+
+    pub fn finish_failure(mut self, label: &str) {
+        let was_notified = self.state.output_started.load(Ordering::Acquire);
+        self.stop_thread();
+        let mut stdout = io::stdout();
+        let _ = if was_notified {
+            execute!(
+                stdout,
+                SetForegroundColor(self.theme.spinner_failed),
+                Print(format!("✘ {label}\n")),
+                ResetColor
+            )
+        } else {
+            execute!(
+                stdout,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                SetForegroundColor(self.theme.spinner_failed),
+                Print(format!("✘ {label}\n")),
+                ResetColor
+            )
+        };
+        let _ = stdout.flush();
+    }
+}
+
+impl Drop for ThinkingSpinner {
+    fn drop(&mut self) {
+        self.stop_thread();
     }
 }
 

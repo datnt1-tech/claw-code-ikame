@@ -142,6 +142,8 @@ impl LineEditor {
             return self.read_line_fallback();
         }
 
+        print_repl_focus_divider();
+
         if let Some(helper) = self.editor.helper_mut() {
             helper.reset_current_line();
         }
@@ -217,6 +219,23 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
         .filter(|candidate| candidate.starts_with('/'))
         .filter(|candidate| seen.insert(candidate.clone()))
         .collect()
+}
+
+/// Print a dim full-width dashed rule before rustyline draws the
+/// prompt so the user's input zone is visually separated from
+/// streamed agent output above. The rule spans the entire terminal
+/// width so it always reads as "end of model turn".
+fn print_repl_focus_divider() {
+    let cols = crossterm::terminal::size()
+        .map(|(w, _)| usize::from(w))
+        .unwrap_or(80);
+    if cols == 0 {
+        return;
+    }
+    let rule: String = "-".repeat(cols);
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "\x1b[90m{rule}\x1b[0m");
+    let _ = stdout.flush();
 }
 
 #[cfg(test)]

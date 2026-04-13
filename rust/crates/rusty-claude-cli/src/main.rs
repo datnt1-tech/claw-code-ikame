@@ -24,7 +24,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model,
+    resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
@@ -40,7 +41,7 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{MarkdownStreamState, TerminalRenderer, ThinkingSpinner};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
@@ -58,11 +59,7 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    provider_max_tokens_for_model(model)
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -178,6 +175,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    apply_config_env_to_process();
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests {
@@ -390,7 +388,10 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    // Track explicitness as `Option<String>` so `--model X` (where X happens
+    // to match DEFAULT_MODEL) is still recognised as user-supplied. The
+    // env/config fallback only applies when the user did NOT pass --model.
+    let mut explicit_model: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -440,11 +441,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias_with_config(value);
+                explicit_model = Some(resolve_model_alias_with_config(value));
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias_with_config(&flag[8..]);
+                explicit_model = Some(resolve_model_alias_with_config(&flag[8..]));
                 index += 1;
             }
             "--output-format" => {
@@ -522,7 +523,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias_with_config(&model),
+                    model: resolve_repl_model(explicit_model),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -580,6 +581,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Ok(CliAction::Version { output_format });
     }
 
+    // Resolve model once, here, so every CliAction variant downstream sees
+    // a final, env/config-aware value. Avoids the older sentinel-based check
+    // that misclassified `--model claude-opus-4-6` as "no --model passed".
+    let model = resolve_repl_model(explicit_model);
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
@@ -992,13 +997,11 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
+fn resolve_model_alias(model: &str) -> String {
+    // Delegate to the API crate so every provider's alias table (Anthropic
+    // opus/sonnet/haiku, xAI grok/grok-mini, DeepSeek deepseek/r1, etc.)
+    // stays in a single source of truth instead of drifting across crates.
+    api::resolve_model_alias(model)
 }
 
 /// Resolve a model name through user-defined config aliases first, then fall
@@ -1007,9 +1010,9 @@ fn resolve_model_alias(model: &str) -> &str {
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
-        return resolve_model_alias(&resolved).to_string();
+        return resolve_model_alias(&resolved);
     }
-    resolve_model_alias(trimmed).to_string()
+    resolve_model_alias(trimmed)
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
@@ -1099,9 +1102,48 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
-fn resolve_repl_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
-        return cli_model;
+/// Apply the merged top-level `env` field from claw config files to the
+/// current process environment so that credentials and base-URL overrides can
+/// live in `~/.claw.json` instead of being exported in the user's shell rc.
+///
+/// Existing process env vars take precedence — we only inject keys that the
+/// shell hasn't already set, so a user can still override the config from the
+/// command line via `FOO=bar claw ...`.
+fn apply_config_env_to_process() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(runtime_config) = loader.load() else {
+        return;
+    };
+    let Some(env_value) = runtime_config.get("env") else {
+        return;
+    };
+    let Some(entries) = env_value.as_object() else {
+        return;
+    };
+    for (key, value) in entries {
+        let Some(value_str) = value.as_str() else {
+            continue;
+        };
+        if env::var_os(key).is_some() {
+            continue;
+        }
+        env::set_var(key, value_str);
+    }
+}
+
+/// Resolve the model to use when no explicit `--model` was supplied on the
+/// command line. Precedence: `ANTHROPIC_MODEL` env var → workspace/user
+/// config `model` field → `DEFAULT_MODEL` constant. The hardcoded constant
+/// only fires as the very last fallback so users who set `model` in config
+/// are not silently overridden by it, and an explicit `--model X` (even if
+/// X happens to equal `DEFAULT_MODEL`) is never mistaken for "user didn't
+/// pass --model".
+fn resolve_repl_model(cli_model: Option<String>) -> String {
+    if let Some(explicit) = cli_model {
+        return explicit;
     }
     if let Some(env_model) = env::var("ANTHROPIC_MODEL")
         .ok()
@@ -1113,7 +1155,7 @@ fn resolve_repl_model(cli_model: String) -> String {
     if let Some(config_model) = config_model_for_current_dir() {
         return resolve_model_alias_with_config(&config_model);
     }
-    cli_model
+    DEFAULT_MODEL.to_string()
 }
 
 fn provider_label(kind: ProviderKind) -> &'static str {
@@ -1121,6 +1163,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
+        ProviderKind::GoogleGenAi => "google",
     }
 }
 
@@ -2462,6 +2505,74 @@ fn format_cost_report(usage: TokenUsage) -> String {
     )
 }
 
+/// Render the cumulative-session `/usage` view: tokens + estimated
+/// dollar cost, with per-token-type breakdown and pricing source.
+/// Falls back to Sonnet-tier pricing (flagged as estimated) when the
+/// model alias isn't in the pricing table — keeps a useful ballpark
+/// for non-Anthropic providers while making the estimate transparent.
+fn format_usage_report(usage: TokenUsage, turns: u32, model: &str) -> String {
+    let pricing = pricing_for_model(model);
+    let cost = pricing
+        .map(|p| usage.estimate_cost_usd_with_pricing(p))
+        .unwrap_or_else(|| usage.estimate_cost_usd());
+    let pricing_source = if pricing.is_some() {
+        "table"
+    } else {
+        "estimated (Sonnet tier)"
+    };
+    format!(
+        "Usage
+  Model            {model}
+  Turns            {turns}
+  Input tokens     {input}
+  Output tokens    {output}
+  Cache create     {cache_create}
+  Cache read       {cache_read}
+  Total tokens     {total}
+  Estimated cost   {total_cost}
+    input          {input_cost}
+    output         {output_cost}
+    cache create   {cache_create_cost}
+    cache read     {cache_read_cost}
+  Pricing source   {pricing_source}",
+        input = usage.input_tokens,
+        output = usage.output_tokens,
+        cache_create = usage.cache_creation_input_tokens,
+        cache_read = usage.cache_read_input_tokens,
+        total = usage.total_tokens(),
+        total_cost = format_usd(cost.total_cost_usd()),
+        input_cost = format_usd(cost.input_cost_usd),
+        output_cost = format_usd(cost.output_cost_usd),
+        cache_create_cost = format_usd(cost.cache_creation_cost_usd),
+        cache_read_cost = format_usd(cost.cache_read_cost_usd),
+    )
+}
+
+fn usage_json_value(usage: TokenUsage, turns: u32, model: &str) -> serde_json::Value {
+    let pricing = pricing_for_model(model);
+    let cost = pricing
+        .map(|p| usage.estimate_cost_usd_with_pricing(p))
+        .unwrap_or_else(|| usage.estimate_cost_usd());
+    serde_json::json!({
+        "kind": "usage",
+        "model": model,
+        "turns": turns,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "total_tokens": usage.total_tokens(),
+        "estimated_cost_usd": cost.total_cost_usd(),
+        "cost_breakdown_usd": {
+            "input": cost.input_cost_usd,
+            "output": cost.output_cost_usd,
+            "cache_creation": cost.cache_creation_cost_usd,
+            "cache_read": cost.cache_read_cost_usd,
+        },
+        "pricing_source": if pricing.is_some() { "table" } else { "estimated-default" },
+    })
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -2745,6 +2856,16 @@ fn run_resume_command(
                 })),
             })
         }
+        SlashCommand::Usage { .. } => {
+            let tracker = UsageTracker::from_session(session);
+            let usage = tracker.cumulative_usage();
+            let model = session.model.as_deref().unwrap_or("restored-session");
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_usage_report(usage, tracker.turns(), model)),
+                json: Some(usage_json_value(usage, tracker.turns(), model)),
+            })
+        }
         SlashCommand::Config { section } => {
             let message = render_config_report(section.as_deref())?;
             let json = render_config_json(section.as_deref())?;
@@ -2937,7 +3058,6 @@ fn run_resume_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
-        | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
@@ -3054,8 +3174,7 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -3741,24 +3860,24 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
+        let spinner = ThinkingSpinner::start(
             "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+            *TerminalRenderer::new().color_theme(),
+        );
+        if let Some(spinner) = spinner.as_ref() {
+            runtime
+                .api_client_mut()
+                .set_output_started_notifier(Some(spinner.notifier()));
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if let Some(spinner) = spinner {
+                    spinner.finish_success("✨ Done");
+                }
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -3771,11 +3890,9 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if let Some(spinner) = spinner {
+                    spinner.finish_failure("❌ Request failed");
+                }
                 Err(Box::new(error))
             }
         }
@@ -3902,6 +4019,10 @@ impl LiveCli {
                 self.print_cost();
                 false
             }
+            SlashCommand::Usage { .. } => {
+                self.print_usage();
+                false
+            }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
             SlashCommand::Config { section } => {
                 Self::print_config(section.as_deref())?;
@@ -3994,7 +4115,6 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
@@ -4238,6 +4358,18 @@ impl LiveCli {
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         println!("{}", format_cost_report(cumulative));
+    }
+
+    fn print_usage(&self) {
+        let tracker = self.runtime.usage();
+        println!(
+            "{}",
+            format_usage_report(
+                tracker.cumulative_usage(),
+                tracker.turns(),
+                &self.model,
+            )
+        );
     }
 
     fn resume_session(
@@ -6700,6 +6832,11 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    /// Fired exactly once by `NotifyingWriter` right before the first
+    /// visible byte of a turn reaches stdout. The CLI wires this to
+    /// its `ThinkingSpinner` so the animated spinner is torn down
+    /// before streamed text starts rendering on the same line.
+    output_started_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6740,17 +6877,16 @@ impl AnthropicRuntimeClient {
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
+            ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::GoogleGenAi => {
                 // The api crate's `ProviderClient::from_model_with_anthropic_auth`
                 // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                // `detect_provider_kind` and builds the right backend.
+                // For OpenAI-compat (xAI, OpenAI, DashScope, OpenRouter, Ollama)
+                // it constructs an `OpenAiCompatClient::from_env` with the
+                // matching `OpenAiCompatConfig`. For Google Generative AI
+                // (gemini-* / google/* / gemini/* model prefixes) it builds
+                // a `GoogleGenAiClient::from_env` that reads `GEMINI_API_KEY`
+                // (or `GOOGLE_API_KEY`) and `GEMINI_BASE_URL`.
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
@@ -6765,11 +6901,49 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            output_started_notifier: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_output_started_notifier(&mut self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.output_started_notifier = notifier;
+    }
+}
+
+/// `io::Write` adaptor that fires a one-shot callback the first time a
+/// non-empty write goes through, then forwards every byte to the inner
+/// writer untouched. Used to tear down the thinking spinner right
+/// before the first streamed byte hits the terminal.
+struct NotifyingWriter<W: Write> {
+    inner: W,
+    notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl<W: Write> Write for NotifyingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !buf.is_empty() {
+            if let Some(n) = self.notifier.take() {
+                n();
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if !buf.is_empty() {
+            if let Some(n) = self.notifier.take() {
+                n();
+            }
+        }
+        self.inner.write_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -6847,7 +7021,10 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
-        let mut stdout = io::stdout();
+        let mut stdout = NotifyingWriter {
+            inner: io::stdout(),
+            notifier: self.output_started_notifier.clone(),
+        };
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
             &mut stdout
@@ -6938,9 +7115,15 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if needs_newline {
+                            writeln!(out)
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -6959,9 +7142,15 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if needs_newline {
+                            writeln!(out)
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                     }
                     events.push(AssistantEvent::MessageStop);
                 }
@@ -7203,7 +7392,6 @@ const STUB_COMMANDS: &[&str] = &[
     "tasks",
     "theme",
     "voice",
-    "usage",
     "rename",
     "copy",
     "hooks",
@@ -7405,7 +7593,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .unwrap_or_default();
             format!(
                 "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
-                format_patch_preview(old_value, new_value)
+                format_patch_preview(old_value, new_value, &path)
                     .map(|preview| format!("\n{preview}"))
                     .unwrap_or_default()
             )
@@ -7483,15 +7671,103 @@ fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
     format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
-fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> {
+const DIFF_REMOVED_BG: &str = "\x1b[48;5;52m";
+const DIFF_ADDED_BG: &str = "\x1b[48;5;22m";
+const DIFF_CODE_BLOCK_BG: &str = "\x1b[48;5;236m";
+const DIFF_CODE_BLOCK_BG_RESET: &str = "\x1b[0;48;5;236m";
+const DIFF_ANSI_RESET: &str = "\x1b[0m";
+const DIFF_MAX_LINES: usize = 24;
+const DIFF_MAX_LINE_LEN: usize = 200;
+
+fn diff_renderer() -> &'static TerminalRenderer {
+    static RENDERER: std::sync::OnceLock<TerminalRenderer> = std::sync::OnceLock::new();
+    RENDERER.get_or_init(TerminalRenderer::new)
+}
+
+fn language_from_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => "rs",
+        "py" | "pyw" => "py",
+        "ts" | "tsx" => "ts",
+        "js" | "jsx" | "mjs" | "cjs" => "js",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "hpp" | "hh" | "cxx" => "cpp",
+        "rb" => "rb",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "sh",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "md" | "markdown" => "md",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" | "sass" => "scss",
+        "sql" => "sql",
+        "xml" => "xml",
+        "swift" => "swift",
+        "kt" | "kts" => "kt",
+        _ => "",
+    }
+}
+
+fn highlight_diff_line(line: &str, marker: char, bg: &str, language: &str) -> String {
+    let truncated = truncate_for_summary(line, DIFF_MAX_LINE_LEN);
+    let body = if language.is_empty() || truncated.is_empty() {
+        truncated
+    } else {
+        let mut code = truncated;
+        code.push('\n');
+        let highlighted = diff_renderer().highlight_code(&code, language);
+        highlighted
+            .replace(
+                DIFF_CODE_BLOCK_BG_RESET,
+                &format!("{DIFF_ANSI_RESET}{bg}"),
+            )
+            .replace(DIFF_CODE_BLOCK_BG, bg)
+            .trim_end_matches('\n')
+            .trim_end_matches(DIFF_ANSI_RESET)
+            .to_string()
+    };
+    format!("{bg}{marker} {body}{DIFF_ANSI_RESET}")
+}
+
+fn format_patch_preview(old_value: &str, new_value: &str, path: &str) -> Option<String> {
     if old_value.is_empty() && new_value.is_empty() {
         return None;
     }
-    Some(format!(
-        "\x1b[38;5;203m- {}\x1b[0m\n\x1b[38;5;70m+ {}\x1b[0m",
-        truncate_for_summary(first_visible_line(old_value), 72),
-        truncate_for_summary(first_visible_line(new_value), 72)
-    ))
+    let language = language_from_path(path);
+    let mut rendered: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for line in old_value.lines() {
+        if rendered.len() >= DIFF_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        rendered.push(highlight_diff_line(line, '-', DIFF_REMOVED_BG, language));
+    }
+    for line in new_value.lines() {
+        if rendered.len() >= DIFF_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        rendered.push(highlight_diff_line(line, '+', DIFF_ADDED_BG, language));
+    }
+
+    if rendered.is_empty() {
+        return None;
+    }
+    if truncated {
+        rendered.push("\x1b[2m… diff truncated\x1b[0m".to_string());
+    }
+    Some(rendered.join("\n"))
 }
 
 fn format_bash_call(parsed: &serde_json::Value) -> String {
@@ -7603,24 +7879,38 @@ fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
     )
 }
 
-fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<String> {
+fn format_structured_patch_preview(parsed: &serde_json::Value, path: &str) -> Option<String> {
     let hunks = parsed.get("structuredPatch")?.as_array()?;
-    let mut preview = Vec::new();
-    for hunk in hunks.iter().take(2) {
-        let lines = hunk.get("lines")?.as_array()?;
-        for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
-            match line.chars().next() {
-                Some('+') => preview.push(format!("\x1b[38;5;70m{line}\x1b[0m")),
-                Some('-') => preview.push(format!("\x1b[38;5;203m{line}\x1b[0m")),
-                _ => preview.push(line.to_string()),
+    let language = language_from_path(path);
+    let mut preview: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    'outer: for hunk in hunks {
+        let Some(lines) = hunk.get("lines").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for line in lines.iter().filter_map(|value| value.as_str()) {
+            if preview.len() >= DIFF_MAX_LINES {
+                truncated = true;
+                break 'outer;
             }
+            let (marker, bg, body) = match line.chars().next() {
+                Some('+') => ('+', DIFF_ADDED_BG, &line[1..]),
+                Some('-') => ('-', DIFF_REMOVED_BG, &line[1..]),
+                Some(' ') => (' ', DIFF_CODE_BLOCK_BG, &line[1..]),
+                _ => (' ', DIFF_CODE_BLOCK_BG, line),
+            };
+            preview.push(highlight_diff_line(body, marker, bg, language));
         }
     }
+
     if preview.is_empty() {
-        None
-    } else {
-        Some(preview.join("\n"))
+        return None;
     }
+    if truncated {
+        preview.push("\x1b[2m… diff truncated\x1b[0m".to_string());
+    }
+    Some(preview.join("\n"))
 }
 
 fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
@@ -7634,7 +7924,7 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
     } else {
         ""
     };
-    let preview = format_structured_patch_preview(parsed).or_else(|| {
+    let preview = format_structured_patch_preview(parsed, &path).or_else(|| {
         let old_value = parsed
             .get("oldString")
             .and_then(|value| value.as_str())
@@ -7643,7 +7933,7 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
             .get("newString")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        format_patch_preview(old_value, new_value)
+        format_patch_preview(old_value, new_value, &path)
     });
 
     match preview {
@@ -8278,6 +8568,7 @@ mod tests {
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_usage_report,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
@@ -8970,6 +9261,7 @@ mod tests {
 
     #[test]
     fn parses_permission_mode_flag() {
+        let _guard = env_lock();
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
@@ -9579,6 +9871,7 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        let _guard = env_lock();
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
@@ -9996,11 +10289,40 @@ mod tests {
 
     #[test]
     fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
-        let user_model = "claude-sonnet-4-6".to_string();
+        let user_model = Some("claude-sonnet-4-6".to_string());
 
         let resolved = resolve_repl_model(user_model);
 
         assert_eq!(resolved, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn resolve_repl_model_keeps_explicit_model_even_when_it_matches_default() {
+        // Regression: previously the function used `cli_model != DEFAULT_MODEL`
+        // as the "user passed --model" signal, so passing `--model
+        // claude-opus-4-6` (matching the default) was indistinguishable from
+        // not passing --model at all and silently triggered the env/config
+        // fallback chain.
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("ANTHROPIC_MODEL", "sonnet");
+
+        let resolved = with_current_dir(&root, || {
+            resolve_repl_model(Some(DEFAULT_MODEL.to_string()))
+        });
+
+        assert_eq!(
+            resolved, DEFAULT_MODEL,
+            "explicit --model that matches DEFAULT_MODEL must not be overridden by env"
+        );
+
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -10014,7 +10336,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(None));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -10033,7 +10355,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(None));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
@@ -10092,6 +10414,47 @@ mod tests {
         assert!(report.contains("Cache create     3"));
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
+    }
+
+    #[test]
+    fn usage_report_includes_cost_breakdown_and_pricing_source_for_known_model() {
+        let report = format_usage_report(
+            runtime::TokenUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 500_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            3,
+            "claude-sonnet-4-20250514",
+        );
+        assert!(report.contains("Usage"));
+        assert!(report.contains("Model            claude-sonnet-4-20250514"));
+        assert!(report.contains("Turns            3"));
+        assert!(report.contains("Total tokens     1500000"));
+        // 1M input @ $15 + 500k output @ $75 = $15 + $37.50 = $52.50
+        assert!(
+            report.contains("Estimated cost   $52.5000"),
+            "missing total cost line in:\n{report}"
+        );
+        assert!(report.contains("input          $15.0000"));
+        assert!(report.contains("output         $37.5000"));
+        assert!(report.contains("Pricing source   table"));
+    }
+
+    #[test]
+    fn usage_report_flags_estimated_pricing_for_unknown_model() {
+        let report = format_usage_report(
+            runtime::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 100,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            1,
+            "deepseek-chat",
+        );
+        assert!(report.contains("Pricing source   estimated (Sonnet tier)"));
     }
 
     #[test]
@@ -11705,6 +12068,32 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn notifying_writer_fires_callback_exactly_once_on_first_nonempty_write() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let notifier: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        let mut writer = super::NotifyingWriter {
+            inner: &mut sink,
+            notifier: Some(notifier),
+        };
+        writer.write_all(b"").expect("empty write ok");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "empty write must not fire");
+        writer.write_all(b"hello").expect("first real write ok");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first write must fire");
+        writer.write_all(b"world").expect("second write ok");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "callback must not fire twice");
+        drop(writer);
+        assert_eq!(&sink, b"helloworld", "all bytes must pass through");
     }
 }
 

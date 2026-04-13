@@ -150,10 +150,20 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
+        if let Some(section) = self.model_specific_section() {
+            sections.push(section);
+        }
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
+        // Project context split: stable bits (cwd, date, branch, instruction
+        // file count) stay close to the front so model context flows naturally.
+        // Volatile bits (git status/diff/staged/recent commits) are deferred
+        // to the very end so prefix-cache providers (DeepSeek, OpenAI) hash
+        // the largest possible stable prefix between turns.
         if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
+            if let Some(stable) = render_project_context_stable(project_context) {
+                sections.push(stable);
+            }
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
@@ -162,6 +172,11 @@ impl SystemPromptBuilder {
             sections.push(render_config_section(config));
         }
         sections.extend(self.append_sections.iter().cloned());
+        if let Some(project_context) = &self.project_context {
+            if let Some(volatile) = render_project_context_volatile(project_context) {
+                sections.push(volatile);
+            }
+        }
         sections
     }
 
@@ -179,9 +194,13 @@ impl SystemPromptBuilder {
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
+        let model_family = self
+            .configured_model()
+            .map(format_model_family)
+            .unwrap_or_else(|| FRONTIER_MODEL_NAME.to_string());
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
+            format!("Model family: {model_family}"),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -192,6 +211,128 @@ impl SystemPromptBuilder {
         ]));
         lines.join("\n")
     }
+
+    fn configured_model(&self) -> Option<&str> {
+        self.config.as_ref().and_then(|config| config.model())
+    }
+
+    fn model_specific_section(&self) -> Option<String> {
+        let model = self.configured_model()?;
+        // Claude is the original target and already trained for this agent
+        // loop — giving it these instructions is redundant and can over-
+        // constrain it. Every other model (Gemini, DeepSeek, Grok, Qwen, etc.)
+        // tends to over-narrate and under-use tools, so they benefit from an
+        // explicit working-style block.
+        if is_non_claude_model(model) {
+            Some(get_non_claude_guidance_section())
+        } else {
+            None
+        }
+    }
+}
+
+/// Maps an internal model id (e.g. `gemini-2.5-pro`, `claude-opus-4-6`) to a
+/// human-readable family name that is safe to surface inside the system prompt.
+#[must_use]
+pub fn format_model_family(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return FRONTIER_MODEL_NAME.to_string();
+    }
+    // Short aliases for the CLI shortcut form (e.g. `claw --model deepseek`).
+    // Alias resolution at the API layer expands these to the canonical name
+    // before routing, but the raw config value can still flow in here.
+    match normalized.as_str() {
+        "deepseek" => return "DeepSeek Chat".to_string(),
+        "r1" => return "DeepSeek Reasoner".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = normalized.strip_prefix("gemini-") {
+        return format!("Gemini {}", humanize_version_segment(rest));
+    }
+    if let Some(rest) = normalized.strip_prefix("claude-") {
+        return format!("Claude {}", humanize_version_segment(rest));
+    }
+    if let Some(rest) = normalized.strip_prefix("gpt-") {
+        return format!("GPT {}", humanize_version_segment(rest));
+    }
+    if let Some(rest) = normalized.strip_prefix("deepseek-") {
+        return format!("DeepSeek {}", humanize_version_segment(rest));
+    }
+    // Unknown vendor — title-case the raw id so it at least reads nicely.
+    humanize_version_segment(&normalized)
+}
+
+fn humanize_version_segment(segment: &str) -> String {
+    let parts: Vec<&str> = segment.split('-').filter(|part| !part.is_empty()).collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < parts.len() {
+        let part = parts[index];
+        let separator = if index == 0 {
+            ""
+        } else if is_all_digits(part)
+            && parts
+                .get(index - 1)
+                .map(|previous| is_all_digits(previous))
+                .unwrap_or(false)
+        {
+            "."
+        } else {
+            " "
+        };
+        out.push_str(separator);
+        let mut chars = part.chars();
+        match chars.next() {
+            Some(first) if first.is_ascii_alphabetic() => {
+                out.push(first.to_ascii_uppercase());
+                out.push_str(chars.as_str());
+            }
+            Some(first) => {
+                out.push(first);
+                out.push_str(chars.as_str());
+            }
+            None => {}
+        }
+        index += 1;
+    }
+    out
+}
+
+fn is_all_digits(segment: &str) -> bool {
+    !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit())
+}
+
+#[must_use]
+pub fn is_gemini_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("gemini-")
+}
+
+/// Returns true for any model that is not from the Claude family. Used to
+/// decide whether to inject the non-Claude agentic working-style section into
+/// the system prompt. Non-Claude models (Gemini, DeepSeek, Grok, Qwen, GPT,
+/// local models, etc.) tend to over-narrate and under-use tools, so they
+/// benefit from explicit guidance that Claude is already trained for.
+#[must_use]
+pub fn is_non_claude_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    !normalized.is_empty() && !normalized.starts_with("claude-")
+}
+
+fn get_non_claude_guidance_section() -> String {
+    [
+        "# Working style",
+        " - You are running inside an agentic CLI with real filesystem and shell tools. Use them aggressively; do not respond like a chatbot when the user requests work on code.",
+        " - When the user asks you to read, inspect, find, edit, or create something in the workspace, call the matching tool immediately instead of describing what you would do.",
+        " - Prefer action over narration. Do not print a multi-step plan before touching tools unless the user explicitly asks for a plan. Brief status lines are fine; long preambles are not.",
+        " - For any non-trivial code change, read the relevant files with the Read tool before editing. Do not guess at file contents or line numbers.",
+        " - Use Edit for targeted changes to existing files (preserve surrounding code and indentation exactly) and Write only when creating a new file or doing a full rewrite.",
+        " - Use Grep/Glob to locate symbols and files rather than asking the user for paths.",
+        " - After making changes, run the project's verification commands (tests, linters, type checks) via Bash when appropriate, and report concrete results — pass/fail, file paths, line numbers.",
+        " - Never claim to have performed an action you did not actually execute through a tool call. If you could not do something, say so plainly.",
+        " - Keep responses concise. Do not re-summarize diffs the user can already see.",
+    ]
+    .join("\n")
 }
 
 /// Formats each item as an indented bullet for prompt sections.
@@ -285,7 +426,11 @@ fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-fn render_project_context(project_context: &ProjectContext) -> String {
+/// Render the cache-stable subset of the project context: cwd, date,
+/// instruction file count, and the current branch name. Anything that
+/// changes between turns (status, diff, staged files, recent commits) is
+/// emitted by `render_project_context_volatile` instead.
+fn render_project_context_stable(project_context: &ProjectContext) -> Option<String> {
     let mut lines = vec!["# Project context".to_string()];
     let mut bullets = vec![
         format!("Today's date is {}.", project_context.current_date),
@@ -297,19 +442,55 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             project_context.instruction_files.len()
         ));
     }
+    if let Some(branch) = project_context
+        .git_context
+        .as_ref()
+        .and_then(|gc| gc.branch.as_deref())
+    {
+        bullets.push(format!("Git branch: {branch}"));
+    }
     lines.extend(prepend_bullets(bullets));
+    Some(lines.join("\n"))
+}
+
+/// Render volatile git data (status, diff, staged files, recent commits).
+/// Placed at the tail of the system prompt so DeepSeek's automatic prefix
+/// cache can hash the maximal stable prefix between turns. Returns None
+/// when there's nothing to surface (non-git directory or clean tree).
+fn render_project_context_volatile(project_context: &ProjectContext) -> Option<String> {
+    let mut lines = Vec::new();
+
+    let recent_commits = project_context
+        .git_context
+        .as_ref()
+        .map(|gc| gc.recent_commits.as_slice())
+        .unwrap_or(&[]);
+    let staged_files = project_context
+        .git_context
+        .as_ref()
+        .map(|gc| gc.staged_files.as_slice())
+        .unwrap_or(&[]);
+
+    let has_anything = project_context.git_status.is_some()
+        || project_context.git_diff.is_some()
+        || !recent_commits.is_empty()
+        || !staged_files.is_empty();
+    if !has_anything {
+        return None;
+    }
+
+    lines.push("# Project context (volatile)".to_string());
+
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(ref gc) = project_context.git_context {
-        if !gc.recent_commits.is_empty() {
-            lines.push(String::new());
-            lines.push("Recent commits (last 5):".to_string());
-            for c in &gc.recent_commits {
-                lines.push(format!("  {} {}", c.hash, c.subject));
-            }
+    if !recent_commits.is_empty() {
+        lines.push(String::new());
+        lines.push("Recent commits (last 5):".to_string());
+        for c in recent_commits {
+            lines.push(format!("  {} {}", c.hash, c.subject));
         }
     }
     if let Some(diff) = &project_context.git_diff {
@@ -317,14 +498,15 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push("Git diff snapshot:".to_string());
         lines.push(diff.clone());
     }
-    if let Some(git_context) = &project_context.git_context {
-        let rendered = git_context.render();
-        if !rendered.is_empty() {
-            lines.push(String::new());
-            lines.push(rendered);
+    if !staged_files.is_empty() {
+        lines.push(String::new());
+        lines.push("Staged files:".to_string());
+        for file in staged_files {
+            lines.push(format!("  {file}"));
         }
     }
-    lines.join("\n")
+
+    Some(lines.join("\n"))
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
@@ -520,11 +702,14 @@ fn get_actions_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        collapse_blank_lines, display_context_path, format_model_family, is_gemini_model,
+        is_non_claude_model, normalize_instruction_content, render_instruction_content,
+        render_instruction_files, render_project_context_volatile, truncate_instruction_content,
+        ContextFile, ProjectContext, SystemPromptBuilder, FRONTIER_MODEL_NAME,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
+    use crate::git_context::GitContext;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -862,6 +1047,81 @@ mod tests {
     }
 
     #[test]
+    fn volatile_git_data_is_emitted_after_stable_sections_for_prefix_cache() {
+        // Two prompts: identical static scaffolding/CLAUDE.md/config, but the
+        // git status differs (as it would between turns). The byte prefix up
+        // to the volatile tail must match exactly so DeepSeek's automatic
+        // prefix cache can hit on the shared head.
+        fn make_context(status: &str, diff: &str) -> ProjectContext {
+            ProjectContext {
+                cwd: PathBuf::from("/tmp/repo"),
+                current_date: "2026-04-13".to_string(),
+                git_status: Some(status.to_string()),
+                git_diff: Some(diff.to_string()),
+                git_context: Some(GitContext {
+                    branch: Some("main".to_string()),
+                    recent_commits: vec![],
+                    staged_files: vec![],
+                }),
+                instruction_files: vec![ContextFile {
+                    path: PathBuf::from("/tmp/repo/CLAUDE.md"),
+                    content: "Project rules".to_string(),
+                }],
+            }
+        }
+
+        let prompt_a = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(make_context("## main\n M src/lib.rs\n", "diff --git a"))
+            .render();
+        let prompt_b = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(make_context(
+                "## main\n M src/lib.rs\n M tests/it.rs\n",
+                "diff --git b",
+            ))
+            .render();
+
+        // Both contain the volatile section header (so we know it ran).
+        assert!(prompt_a.contains("# Project context (volatile)"));
+        assert!(prompt_b.contains("# Project context (volatile)"));
+
+        // Branch (stable) appears in the leading project-context bullets,
+        // before any git_status snapshot.
+        let stable_marker_a = prompt_a
+            .find("Git branch: main")
+            .expect("branch in stable context");
+        let volatile_marker_a = prompt_a
+            .find("# Project context (volatile)")
+            .expect("volatile section");
+        assert!(stable_marker_a < volatile_marker_a);
+
+        // The bytes shared up to the volatile divergence must be identical.
+        let prefix_a = &prompt_a[..volatile_marker_a];
+        let volatile_marker_b = prompt_b
+            .find("# Project context (volatile)")
+            .expect("volatile section");
+        let prefix_b = &prompt_b[..volatile_marker_b];
+        assert_eq!(
+            prefix_a, prefix_b,
+            "stable prompt prefix must be byte-identical so prefix caches hit"
+        );
+    }
+
+    #[test]
+    fn project_context_volatile_returns_none_when_no_git_data() {
+        let context = ProjectContext {
+            cwd: PathBuf::from("/tmp/repo"),
+            current_date: "2026-04-13".to_string(),
+            git_status: None,
+            git_diff: None,
+            git_context: None,
+            instruction_files: vec![],
+        };
+        assert!(render_project_context_volatile(&context).is_none());
+    }
+
+    #[test]
     fn truncates_instruction_content_to_budget() {
         let content = "x".repeat(5_000);
         let rendered = truncate_instruction_content(&content, 4_000);
@@ -901,5 +1161,128 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn format_model_family_handles_known_vendors() {
+        assert_eq!(format_model_family("gemini-2.5-pro"), "Gemini 2.5 Pro");
+        assert_eq!(format_model_family("gemini-2.5-flash"), "Gemini 2.5 Flash");
+        assert_eq!(format_model_family("claude-opus-4-6"), "Claude Opus 4.6");
+        assert_eq!(format_model_family("claude-sonnet-4-5"), "Claude Sonnet 4.5");
+        assert_eq!(format_model_family("gpt-4o-mini"), "GPT 4o Mini");
+        assert_eq!(format_model_family("deepseek-chat"), "DeepSeek Chat");
+        assert_eq!(
+            format_model_family("deepseek-reasoner"),
+            "DeepSeek Reasoner"
+        );
+        // Short CLI aliases resolve to the canonical display name.
+        assert_eq!(format_model_family("deepseek"), "DeepSeek Chat");
+        assert_eq!(format_model_family("r1"), "DeepSeek Reasoner");
+        // Empty / whitespace fall back to the frontier default.
+        assert_eq!(format_model_family(""), FRONTIER_MODEL_NAME);
+        assert_eq!(format_model_family("   "), FRONTIER_MODEL_NAME);
+    }
+
+    #[test]
+    fn is_gemini_model_detects_gemini_prefix() {
+        assert!(is_gemini_model("gemini-2.5-pro"));
+        assert!(is_gemini_model("Gemini-2.5-Flash"));
+        assert!(!is_gemini_model("claude-opus-4-6"));
+        assert!(!is_gemini_model(""));
+    }
+
+    #[test]
+    fn is_non_claude_model_identifies_non_claude_families() {
+        assert!(is_non_claude_model("gemini-2.5-pro"));
+        assert!(is_non_claude_model("deepseek-chat"));
+        assert!(is_non_claude_model("grok-3"));
+        assert!(is_non_claude_model("gpt-4o"));
+        assert!(!is_non_claude_model("claude-opus-4-6"));
+        assert!(!is_non_claude_model("Claude-Sonnet-4-5"));
+        // Empty / whitespace: nothing configured → no guidance.
+        assert!(!is_non_claude_model(""));
+        assert!(!is_non_claude_model("   "));
+    }
+
+    #[test]
+    fn gemini_config_injects_guidance_section_and_model_family() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(
+            root.join(".claw.json"),
+            r#"{"model":"gemini-2.5-pro"}"#,
+        )
+        .expect("write config");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-04-10").expect("context should load");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .with_runtime_config(config)
+            .render();
+
+        assert!(prompt.contains("# Working style"));
+        assert!(prompt.contains("Model family: Gemini 2.5 Pro"));
+        assert!(!prompt.contains(&format!("Model family: {FRONTIER_MODEL_NAME}")));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn deepseek_config_injects_guidance_section_and_model_family() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(
+            root.join(".claw.json"),
+            r#"{"model":"deepseek-chat"}"#,
+        )
+        .expect("write config");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-04-10").expect("context should load");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .with_runtime_config(config)
+            .render();
+
+        assert!(prompt.contains("# Working style"));
+        assert!(prompt.contains("Model family: DeepSeek Chat"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn claude_config_omits_working_style_section() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(
+            root.join(".claw.json"),
+            r#"{"model":"claude-opus-4-6"}"#,
+        )
+        .expect("write config");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-04-10").expect("context should load");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .with_runtime_config(config)
+            .render();
+
+        assert!(!prompt.contains("# Working style"));
+        assert!(prompt.contains("Model family: Claude Opus 4.6"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

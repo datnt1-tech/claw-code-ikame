@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
+use crate::providers::google_genai::{self, GoogleGenAiClient};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -11,6 +12,7 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    GoogleGenAi(GoogleGenAiClient),
 }
 
 impl ProviderClient {
@@ -32,17 +34,22 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
+                // DashScope (qwen-*) and DeepSeek (deepseek-*) models also return
+                // ProviderKind::OpenAi because they speak the OpenAI wire format,
+                // but each needs its own config (distinct api key env var and
+                // base URL). Select based on the metadata auth_env.
                 let config = match providers::metadata_for_model(&resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                         OpenAiCompatConfig::dashscope()
+                    }
+                    Some(meta) if meta.auth_env == "DEEPSEEK_API_KEY" => {
+                        OpenAiCompatConfig::deepseek()
                     }
                     _ => OpenAiCompatConfig::openai(),
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
+            ProviderKind::GoogleGenAi => Ok(Self::GoogleGenAi(GoogleGenAiClient::from_env()?)),
         }
     }
 
@@ -52,6 +59,7 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::GoogleGenAi(_) => ProviderKind::GoogleGenAi,
         }
     }
 
@@ -67,7 +75,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::GoogleGenAi(_) => None,
         }
     }
 
@@ -75,7 +83,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::GoogleGenAi(_) => None,
         }
     }
 
@@ -86,6 +94,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::GoogleGenAi(client) => client.send_message(request).await,
         }
     }
 
@@ -102,6 +111,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::GoogleGenAi(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::GoogleGenAi),
         }
     }
 }
@@ -110,6 +123,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    GoogleGenAi(google_genai::MessageStream),
 }
 
 impl MessageStream {
@@ -118,6 +132,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::GoogleGenAi(stream) => stream.request_id(),
         }
     }
 
@@ -125,6 +140,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::GoogleGenAi(stream) => stream.next_event().await,
         }
     }
 }
@@ -167,11 +183,28 @@ mod tests {
     }
 
     #[test]
+    fn resolves_deepseek_short_aliases() {
+        assert_eq!(resolve_model_alias("deepseek"), "deepseek-chat");
+        assert_eq!(resolve_model_alias("r1"), "deepseek-reasoner");
+        // Full canonical names pass through unchanged.
+        assert_eq!(resolve_model_alias("deepseek-chat"), "deepseek-chat");
+        assert_eq!(
+            resolve_model_alias("deepseek-reasoner"),
+            "deepseek-reasoner"
+        );
+    }
+
+    #[test]
     fn provider_detection_prefers_model_family() {
         assert_eq!(detect_provider_kind("grok-3"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
+        );
+        assert_eq!(detect_provider_kind("deepseek-chat"), ProviderKind::OpenAi);
+        assert_eq!(
+            detect_provider_kind("deepseek-reasoner"),
+            ProviderKind::OpenAi
         );
     }
 
@@ -233,6 +266,38 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek_model_uses_deepseek_config_not_openai() {
+        // DeepSeek speaks the OpenAI wire format but lives at api.deepseek.com
+        // and authenticates with DEEPSEEK_API_KEY. Without this routing,
+        // deepseek-chat would try OPENAI_API_KEY and api.openai.com.
+        let _lock = env_lock();
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("test-deepseek-key"));
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+
+        let client = ProviderClient::from_model("deepseek-chat");
+
+        assert!(
+            client.is_ok(),
+            "deepseek-chat with DEEPSEEK_API_KEY set should build successfully, got: {:?}",
+            client.err()
+        );
+
+        match client.unwrap() {
+            ProviderClient::OpenAi(openai_client) => {
+                assert!(
+                    openai_client.base_url().contains("api.deepseek.com"),
+                    "deepseek-chat should route to DeepSeek base URL (contains 'api.deepseek.com'), got: {}",
+                    openai_client.base_url()
+                );
+            }
+            other => panic!(
+                "Expected ProviderClient::OpenAi for deepseek-chat, got: {:?}",
+                other
+            ),
         }
     }
 }

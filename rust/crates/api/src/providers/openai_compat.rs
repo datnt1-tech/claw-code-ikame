@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -36,6 +37,7 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -72,12 +74,25 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// DeepSeek official API (`deepseek-chat`, `deepseek-reasoner`).
+    /// Speaks the OpenAI REST shape at /v1/chat/completions.
+    #[must_use]
+    pub const fn deepseek() -> Self {
+        Self {
+            provider_name: "DeepSeek",
+            api_key_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "DeepSeek" => DEEPSEEK_ENV_VARS,
             _ => &[],
         }
     }
@@ -465,9 +480,9 @@ impl StreamState {
 
         if let Some(usage) = chunk.usage {
             self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
+                input_tokens: usage.uncached_input_tokens(),
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_read_input_tokens: usage.cached_input_tokens(),
                 output_tokens: usage.completion_tokens,
             });
         }
@@ -669,6 +684,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek-Reasoner streams its chain-of-thought here, separate from
+    /// `content`. We accept the field so deserialization succeeds, but drop
+    /// it: the CLI only renders the final answer to keep terminal output
+    /// uncluttered. Surface it later if a debug/verbose mode demands it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -691,6 +713,30 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    /// DeepSeek reports cache hits on prompt prefix via this field.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    /// OpenAI nests the same information under `prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl OpenAiUsage {
+    fn cached_input_tokens(&self) -> u32 {
+        self.prompt_cache_hit_tokens
+            .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .unwrap_or(0)
+    }
+
+    fn uncached_input_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_sub(self.cached_input_tokens())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -715,6 +761,12 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek-Reasoner emits chain-of-thought tokens here before any
+    /// `content` arrives. Accept the field to avoid deserialization errors;
+    /// see `ChatMessage::reasoning_content` for why we drop it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -766,6 +818,11 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.starts_with("qwen-qwq")
         || canonical.starts_with("qwq")
         || canonical.contains("thinking")
+        // DeepSeek-Reasoner family ignores temperature/top_p/penalties per
+        // their docs; treat them as reasoning models so we don't waste
+        // bytes (and risk future provider-side validation).
+        || canonical == "deepseek-reasoner"
+        || canonical.starts_with("deepseek-r1")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -1100,9 +1157,12 @@ fn normalize_response(
             input_tokens: response
                 .usage
                 .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
+                .map_or(0, OpenAiUsage::uncached_input_tokens),
             cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, OpenAiUsage::cached_input_tokens),
             output_tokens: response
                 .usage
                 .as_ref()
@@ -1288,8 +1348,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        normalize_finish_reason, normalize_response, openai_tool_choice, parse_tool_arguments,
+        OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1793,5 +1853,106 @@ mod tests {
             payload.get("max_completion_tokens").is_none(),
             "gpt-4o must not emit max_completion_tokens"
         );
+    }
+
+    #[test]
+    fn deepseek_prompt_cache_hit_tokens_map_to_cache_read() {
+        // DeepSeek returns `prompt_cache_hit_tokens` in the usage block when the
+        // prefix cache hits. Split prompt_tokens into uncached + cached so the
+        // unified Usage surface matches Anthropic semantics.
+        let usage: super::OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 64,
+            "prompt_cache_hit_tokens": 1000,
+            "prompt_cache_miss_tokens": 200
+        }))
+        .expect("parse DeepSeek usage");
+        assert_eq!(usage.cached_input_tokens(), 1000);
+        assert_eq!(usage.uncached_input_tokens(), 200);
+    }
+
+    #[test]
+    fn openai_prompt_tokens_details_map_to_cache_read() {
+        let usage: super::OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 800,
+            "completion_tokens": 32,
+            "prompt_tokens_details": {"cached_tokens": 512}
+        }))
+        .expect("parse OpenAI usage");
+        assert_eq!(usage.cached_input_tokens(), 512);
+        assert_eq!(usage.uncached_input_tokens(), 288);
+    }
+
+    #[test]
+    fn usage_without_cache_fields_stays_zero_cached() {
+        let usage: super::OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10
+        }))
+        .expect("parse plain usage");
+        assert_eq!(usage.cached_input_tokens(), 0);
+        assert_eq!(usage.uncached_input_tokens(), 100);
+    }
+
+    #[test]
+    fn deepseek_reasoner_is_classified_as_reasoning_model() {
+        // DeepSeek-Reasoner ignores tuning params per their docs; treat it
+        // like other reasoning models so the request stays minimal.
+        assert!(is_reasoning_model("deepseek-reasoner"));
+        assert!(is_reasoning_model("deepseek-r1"));
+        assert!(is_reasoning_model("deepseek-r1-distill-qwen-32b"));
+        // Plain deepseek-chat still accepts tuning params.
+        assert!(!is_reasoning_model("deepseek-chat"));
+        assert!(!is_reasoning_model("deepseek-coder"));
+    }
+
+    #[test]
+    fn streaming_chunk_with_reasoning_content_parses_and_drops_it() {
+        // DeepSeek-Reasoner streams chain-of-thought via `reasoning_content`
+        // before any `content` arrives. We need parsing to succeed; the
+        // reasoning text itself is intentionally not surfaced.
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "Let me think step by step..."
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("parse reasoner chunk");
+        let delta = &chunk.choices[0].delta;
+        assert!(delta.content.is_none());
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("Let me think step by step...")
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_with_reasoning_content_parses_and_drops_it() {
+        let response: super::ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-2",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "thinking...",
+                    "content": "The answer is 42."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("parse reasoner response");
+        let normalized = normalize_response("deepseek-reasoner", response).expect("normalize");
+        // Only the final answer surfaces — reasoning_content is dropped.
+        assert_eq!(normalized.content.len(), 1);
+        match &normalized.content[0] {
+            crate::types::OutputContentBlock::Text { text } => {
+                assert_eq!(text, "The answer is 42.");
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
     }
 }

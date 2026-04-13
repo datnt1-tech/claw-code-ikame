@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod google_genai;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -33,6 +34,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    GoogleGenAi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +124,24 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "deepseek",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        },
+    ),
+    (
+        "r1",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -144,7 +164,12 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "deepseek" => "deepseek-chat",
+                    "r1" => "deepseek-reasoner",
+                    _ => trimmed,
+                },
+                ProviderKind::GoogleGenAi => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -194,6 +219,33 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // DeepSeek official API. Routes deepseek/* and bare deepseek-* model
+    // names (deepseek-chat, deepseek-reasoner) to the OpenAI-compat client
+    // pointed at api.deepseek.com/v1. Uses the OpenAi provider kind because
+    // DeepSeek speaks the OpenAI REST shape.
+    if canonical.starts_with("deepseek/") || canonical.starts_with("deepseek-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
+    // Google Generative AI / Gemini family. Routes any model name with a
+    // gemini-/google/-style prefix to the native Gemini REST backend so users
+    // can point GEMINI_BASE_URL at the official endpoint or any compatible
+    // proxy (LiteLLM, internal company gateways, etc.).
+    if canonical.starts_with("gemini-")
+        || canonical.starts_with("gemini/")
+        || canonical.starts_with("google/")
+    {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::GoogleGenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: google_genai::DEFAULT_BASE_URL,
+        });
+    }
     None
 }
 
@@ -219,6 +271,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    if google_genai::has_credentials() {
+        return ProviderKind::GoogleGenAi;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
@@ -265,6 +320,13 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         }),
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        }),
+        // DeepSeek caps max_tokens at 8192 and provides a 128k context window
+        // for both deepseek-chat (V3) and deepseek-reasoner (R1). Requests
+        // above 8192 output tokens are rejected with 400 invalid_request_error.
+        "deepseek-chat" | "deepseek-reasoner" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
         _ => None,
@@ -324,6 +386,21 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "DEEPSEEK_API_KEY",
+        "DeepSeek",
+        "use a DeepSeek model alias (e.g. `--model deepseek-chat` or `--model deepseek-reasoner`) so the prefix router selects the DeepSeek backend, and set `DEEPSEEK_BASE_URL` if you are pointing at a custom proxy",
+    ),
+    (
+        "GEMINI_API_KEY",
+        "Google Generative AI (Gemini)",
+        "use a `gemini-` model alias (e.g. `--model gemini-2.5-flash`) so prefix routing selects the Gemini backend, and set `GEMINI_BASE_URL` if you are pointing at a custom proxy",
+    ),
+    (
+        "GOOGLE_API_KEY",
+        "Google Generative AI (Gemini)",
+        "use a `gemini-` model alias (e.g. `--model gemini-2.5-flash`) so prefix routing selects the Gemini backend, and set `GEMINI_BASE_URL` if you are pointing at a custom proxy",
     ),
 ];
 
