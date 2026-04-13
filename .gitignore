@@ -8,5 +8,6 @@ archive/
 # Claw Code local artifacts
 .claw/settings.local.json
 .claw/sessions/
+**/.claw/sessions/
 .clawhip/
 status-help.txt
