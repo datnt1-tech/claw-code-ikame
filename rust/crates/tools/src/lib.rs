@@ -11,8 +11,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    append_file, check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash,
+    glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -422,12 +422,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Write a text file in the workspace. Set `append: true` to add to the end of the file instead of overwriting it — use this to chunk large files across several calls when a single payload would exceed your output-token limit.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "append": {
+                        "type": "boolean",
+                        "description": "When true, append `content` to the existing file (creating it if missing) instead of overwriting. Intended for splitting a large write across multiple calls."
+                    }
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
@@ -2066,7 +2070,12 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let output = if input.append.unwrap_or(false) {
+        append_file(&input.path, &input.content).map_err(io_to_string)?
+    } else {
+        write_file(&input.path, &input.content).map_err(io_to_string)?
+    };
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2246,6 +2255,8 @@ struct ReadFileInput {
 struct WriteFileInput {
     path: String,
     content: String,
+    #[serde(default)]
+    append: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8834,6 +8845,61 @@ mod tests {
         )
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_append_chunks_into_one_file() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("fs-append");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let first = execute_tool(
+            "write_file",
+            &json!({ "path": "chunks.txt", "content": "head\n", "append": true }),
+        )
+        .expect("first append should succeed");
+        let first_output: serde_json::Value = serde_json::from_str(&first).expect("json");
+        assert_eq!(first_output["type"], "create");
+
+        let second = execute_tool(
+            "write_file",
+            &json!({ "path": "chunks.txt", "content": "middle\n", "append": true }),
+        )
+        .expect("second append should succeed");
+        let second_output: serde_json::Value = serde_json::from_str(&second).expect("json");
+        assert_eq!(second_output["type"], "append");
+
+        let third = execute_tool(
+            "write_file",
+            &json!({ "path": "chunks.txt", "content": "tail\n", "append": true }),
+        )
+        .expect("third append should succeed");
+        let third_output: serde_json::Value = serde_json::from_str(&third).expect("json");
+        assert_eq!(third_output["type"], "append");
+
+        assert_eq!(
+            fs::read_to_string(root.join("chunks.txt")).expect("read file"),
+            "head\nmiddle\ntail\n"
+        );
+
+        let overwrite = execute_tool(
+            "write_file",
+            &json!({ "path": "chunks.txt", "content": "replaced\n" }),
+        )
+        .expect("overwrite should succeed");
+        let overwrite_output: serde_json::Value = serde_json::from_str(&overwrite).expect("json");
+        assert_eq!(overwrite_output["type"], "update");
+        assert_eq!(
+            fs::read_to_string(root.join("chunks.txt")).expect("read file"),
+            "replaced\n"
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);

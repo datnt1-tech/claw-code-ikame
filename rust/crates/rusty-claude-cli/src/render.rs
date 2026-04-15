@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -134,6 +134,25 @@ struct ThinkingSpinnerState {
     stop: AtomicBool,
     output_started: AtomicBool,
     cleared: AtomicBool,
+    started_at: Instant,
+}
+
+/// Render an elapsed duration as a compact "processing" counter. Keeps
+/// whole seconds under a minute (`"3s"`), switches to `"1m 05s"` once a
+/// minute has passed, and to `"1h 02m"` for very long calls.
+fn format_spinner_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    if total < 60 {
+        format!("{total}s")
+    } else if total < 3600 {
+        let minutes = total / 60;
+        let seconds = total % 60;
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        let hours = total / 3600;
+        let minutes = (total % 3600) / 60;
+        format!("{hours}h {minutes:02}m")
+    }
 }
 
 impl ThinkingSpinner {
@@ -148,6 +167,7 @@ impl ThinkingSpinner {
             stop: AtomicBool::new(false),
             output_started: AtomicBool::new(false),
             cleared: AtomicBool::new(false),
+            started_at: Instant::now(),
         });
         let label = label.into();
         let state_thread = Arc::clone(&state);
@@ -167,13 +187,14 @@ impl ThinkingSpinner {
                 }
                 let frame = Spinner::FRAMES[frame_index % Spinner::FRAMES.len()];
                 frame_index += 1;
+                let elapsed = format_spinner_elapsed(state_thread.started_at.elapsed());
                 let _ = queue!(
                     stdout,
                     SavePosition,
                     MoveToColumn(0),
                     Clear(ClearType::CurrentLine),
                     SetForegroundColor(theme_thread.spinner_active),
-                    Print(format!("{frame} {label}")),
+                    Print(format!("{frame} {label} ({elapsed})")),
                     ResetColor,
                     RestorePosition
                 );
@@ -215,13 +236,15 @@ impl ThinkingSpinner {
     /// screen ending in a newline; just append the marker.
     pub fn finish_success(mut self, label: &str) {
         let was_notified = self.state.output_started.load(Ordering::Acquire);
+        let elapsed = format_spinner_elapsed(self.state.started_at.elapsed());
         self.stop_thread();
         let mut stdout = io::stdout();
+        let line = format!("✔ {label} ({elapsed})\n");
         let _ = if was_notified {
             execute!(
                 stdout,
                 SetForegroundColor(self.theme.spinner_done),
-                Print(format!("✔ {label}\n")),
+                Print(line),
                 ResetColor
             )
         } else {
@@ -230,7 +253,7 @@ impl ThinkingSpinner {
                 MoveToColumn(0),
                 Clear(ClearType::CurrentLine),
                 SetForegroundColor(self.theme.spinner_done),
-                Print(format!("✔ {label}\n")),
+                Print(line),
                 ResetColor
             )
         };
@@ -239,13 +262,15 @@ impl ThinkingSpinner {
 
     pub fn finish_failure(mut self, label: &str) {
         let was_notified = self.state.output_started.load(Ordering::Acquire);
+        let elapsed = format_spinner_elapsed(self.state.started_at.elapsed());
         self.stop_thread();
         let mut stdout = io::stdout();
+        let line = format!("✘ {label} ({elapsed})\n");
         let _ = if was_notified {
             execute!(
                 stdout,
                 SetForegroundColor(self.theme.spinner_failed),
-                Print(format!("✘ {label}\n")),
+                Print(line),
                 ResetColor
             )
         } else {
@@ -254,7 +279,7 @@ impl ThinkingSpinner {
                 MoveToColumn(0),
                 Clear(ClearType::CurrentLine),
                 SetForegroundColor(self.theme.spinner_failed),
-                Print(format!("✘ {label}\n")),
+                Print(line),
                 ResetColor
             )
         };
@@ -420,7 +445,11 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        let trimmed = output.trim_end().to_string();
+        match terminal_wrap_width() {
+            Some(width) => wrap_for_terminal(&trimmed, width),
+            None => trimmed,
+        }
     }
 
     #[must_use]
@@ -1041,6 +1070,111 @@ fn visible_width(input: &str) -> usize {
     strip_ansi(input).chars().count()
 }
 
+fn terminal_wrap_width() -> Option<usize> {
+    if std::env::var_os("CLAW_DISABLE_SOFT_WRAP").is_some() {
+        return None;
+    }
+    let (cols, _) = crossterm::terminal::size().ok()?;
+    let cols = usize::from(cols);
+    if cols < 20 {
+        None
+    } else {
+        Some(cols)
+    }
+}
+
+/// Word-wrap rendered markdown to `width` columns, preserving ANSI styles
+/// and leading indentation. Code-block content (lines carrying the syntect
+/// background SGR) is left untouched so syntax highlighting stays intact.
+fn wrap_for_terminal(rendered: &str, width: usize) -> String {
+    if width < 20 {
+        return rendered.to_string();
+    }
+    let mut out = String::with_capacity(rendered.len() + 16);
+    for segment in rendered.split_inclusive('\n') {
+        let (body, tail) = match segment.strip_suffix('\n') {
+            Some(rest) => (rest, "\n"),
+            None => (segment, ""),
+        };
+        if body.is_empty() || should_skip_wrap(body) || visible_width(body) <= width {
+            out.push_str(body);
+            out.push_str(tail);
+            continue;
+        }
+        soft_wrap_line_into(&mut out, body, width);
+        out.push_str(tail);
+    }
+    out
+}
+
+fn should_skip_wrap(line: &str) -> bool {
+    // Leave syntax-highlighted code lines alone — they carry a 256-color
+    // background SGR and reflowing mid-token would mangle the look.
+    line.contains("\u{1b}[48;5;236m") || line.contains("48;5;236m")
+}
+
+fn soft_wrap_line_into(out: &mut String, body: &str, width: usize) {
+    let chars: Vec<char> = body.chars().collect();
+    let indent_visible = chars
+        .iter()
+        .take_while(|c| **c == ' ')
+        .count()
+        .min(width.saturating_sub(10));
+    let continuation: String = " ".repeat(indent_visible);
+
+    let mut col = 0usize;
+    let mut i = 0usize;
+
+    while i < chars.len() && chars[i] == ' ' {
+        out.push(' ');
+        col += 1;
+        i += 1;
+    }
+
+    while i < chars.len() {
+        let mut space_seen = false;
+        while i < chars.len() && chars[i] == ' ' {
+            space_seen = true;
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+
+        let start = i;
+        let mut word_visible = 0usize;
+        while i < chars.len() && chars[i] != ' ' {
+            if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+                i += 2;
+                while i < chars.len() && !chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+                word_visible += 1;
+            }
+        }
+
+        let space_cost = usize::from(space_seen && col > 0);
+        if col > 0 && col + space_cost + word_visible > width {
+            out.push('\n');
+            out.push_str(&continuation);
+            col = indent_visible;
+        } else if space_seen && col > 0 {
+            out.push(' ');
+            col += 1;
+        }
+
+        for ch in &chars[start..i] {
+            out.push(*ch);
+        }
+        col += word_visible;
+    }
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut output = String::new();
     let mut chars = input.chars().peekable();
@@ -1065,7 +1199,11 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{
+        format_spinner_elapsed, should_skip_wrap, strip_ansi, visible_width, wrap_for_terminal,
+        MarkdownStreamState, Spinner, TerminalRenderer,
+    };
+    use std::time::Duration;
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -1219,5 +1357,70 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn wrap_keeps_short_lines_untouched() {
+        let input = "hello world\nand again\n";
+        assert_eq!(wrap_for_terminal(input, 40), input);
+    }
+
+    #[test]
+    fn wrap_breaks_long_paragraph_at_word_boundary() {
+        let input =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron";
+        let wrapped = wrap_for_terminal(input, 30);
+        for line in wrapped.lines() {
+            assert!(visible_width(line) <= 30, "line too wide: {line:?}");
+            assert!(!line.ends_with(' '));
+        }
+        let rejoined = wrapped.replace('\n', " ");
+        assert_eq!(rejoined, input);
+    }
+
+    #[test]
+    fn wrap_preserves_leading_indent_on_continuation() {
+        let input = "    • first bullet item with quite a lot of trailing content text blah more words to force wrap";
+        let wrapped = wrap_for_terminal(input, 40);
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert!(lines.len() >= 2, "should have wrapped: {wrapped:?}");
+        assert!(
+            lines[1].starts_with("    "),
+            "continuation indent missing: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn wrap_skips_code_block_lines() {
+        let bg = "\u{1b}[48;5;236m";
+        let line =
+            format!("{bg}fn very_long_function_name_that_would_otherwise_wrap_and_wrap_more() {{}}\u{1b}[0m");
+        assert!(should_skip_wrap(&line));
+        let wrapped = wrap_for_terminal(&line, 30);
+        assert_eq!(wrapped, line);
+    }
+
+    #[test]
+    fn spinner_elapsed_formats_across_ranges() {
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(format_spinner_elapsed(Duration::from_secs(3_700)), "1h 01m");
+    }
+
+    #[test]
+    fn wrap_handles_ansi_styled_text_width() {
+        let styled = "\u{1b}[1mhello\u{1b}[0m \u{1b}[1mworld\u{1b}[0m \u{1b}[1mfoo\u{1b}[0m \u{1b}[1mbar\u{1b}[0m \u{1b}[1mbaz\u{1b}[0m \u{1b}[1mqux\u{1b}[0m \u{1b}[1mquux\u{1b}[0m";
+        let wrapped = wrap_for_terminal(styled, 25);
+        for line in wrapped.lines() {
+            assert!(visible_width(line) <= 25, "line too wide: {line:?}");
+        }
+        assert!(
+            wrapped.lines().count() >= 2,
+            "should have wrapped: {wrapped:?}"
+        );
     }
 }

@@ -90,20 +90,46 @@ impl GoogleGenAiClient {
             ..request.clone()
         };
         preflight_message_request(&request)?;
-        let response = self.post_with_retry(&request, false).await?;
+        let (response, effective_request) = self
+            .post_with_max_tokens_adaptation(&request, false)
+            .await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         if let Some(api_error) = inline_error_response(&body, request_id.clone()) {
             return Err(api_error);
         }
         let payload = serde_json::from_str::<GenerateContentResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(PROVIDER_NAME, &request.model, &body, error)
+            ApiError::json_deserialize(PROVIDER_NAME, &effective_request.model, &body, error)
         })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = normalize_response(&effective_request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
         Ok(normalized)
+    }
+
+    async fn post_with_max_tokens_adaptation(
+        &self,
+        request: &MessageRequest,
+        stream: bool,
+    ) -> Result<(reqwest::Response, MessageRequest), ApiError> {
+        match self.post_with_retry(request, stream).await {
+            Ok(response) => Ok((response, request.clone())),
+            Err(error) if error.is_max_tokens_exceeded() => {
+                let downgraded =
+                    super::downgrade_max_tokens_for_retry(&request.model, request.max_tokens);
+                if downgraded >= request.max_tokens {
+                    return Err(error);
+                }
+                let adjusted = MessageRequest {
+                    max_tokens: downgraded,
+                    ..request.clone()
+                };
+                let response = self.post_with_retry(&adjusted, stream).await?;
+                Ok((response, adjusted))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn stream_message(
@@ -115,7 +141,9 @@ impl GoogleGenAiClient {
             stream: true,
             ..request.clone()
         };
-        let response = self.post_with_retry(&streaming, true).await?;
+        let (response, _) = self
+            .post_with_max_tokens_adaptation(&streaming, true)
+            .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,

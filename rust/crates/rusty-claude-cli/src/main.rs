@@ -1172,6 +1172,23 @@ fn format_connected_line(model: &str) -> String {
     format!("Connected: {model} via {provider}")
 }
 
+/// Surface a one-line advisory when the active model has a small
+/// `max_output_tokens` budget. These caps cause large `write_file` calls to be
+/// cut off mid-JSON, which then fails to parse. The banner warns once so the
+/// user can either switch models or plan to split big edits upfront.
+fn format_model_output_cap_warning(model: &str) -> Option<String> {
+    const LOW_OUTPUT_CAP: u32 = 16_000;
+    let limit = model_token_limit(model)?;
+    if limit.max_output_tokens >= LOW_OUTPUT_CAP {
+        return None;
+    }
+    Some(format!(
+        "\x1b[1;33m⚠\x1b[0m  {model} caps output at {cap} tokens — big write_file payloads may be truncated. \
+         Prefer edit/patch tools for large files, or switch to a higher-capacity model (e.g. /model claude-sonnet-4-6).",
+        cap = limit.max_output_tokens,
+    ))
+}
+
 fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
@@ -2427,12 +2444,17 @@ Usage
 }
 
 fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
-    format!(
+    let mut report = format!(
         "Model updated
   Previous         {previous}
   Current          {next}
   Preserved msgs   {message_count}"
-    )
+    );
+    if let Some(warning) = format_model_output_cap_warning(next) {
+        report.push('\n');
+        report.push_str(&warning);
+    }
+    report
 }
 
 fn format_permissions_report(mode: &str) -> String {
@@ -3205,6 +3227,9 @@ fn run_repl(
     );
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    if let Some(warning) = format_model_output_cap_warning(&cli.model) {
+        println!("{warning}");
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3887,7 +3912,7 @@ impl LiveCli {
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let spinner =
-            ThinkingSpinner::start("🔥 Thinking...", *TerminalRenderer::new().color_theme());
+            ThinkingSpinner::start("🔥 Processing", *TerminalRenderer::new().color_theme());
         if let Some(spinner) = spinner.as_ref() {
             runtime
                 .api_client_mut()
@@ -8487,8 +8512,9 @@ impl CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let value = serde_json::from_str(input).map_err(|error| {
+            ToolError::new(format_tool_input_parse_error(tool_name, input, &error))
+        })?;
         if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
@@ -8507,6 +8533,73 @@ impl CliToolExecutor {
         let markdown = format_tool_result(tool_name, output, is_error);
         let _ = self.renderer.stream_markdown(&markdown, &mut io::stdout());
     }
+}
+
+/// Build an actionable error for a tool call whose argument JSON failed to
+/// parse. When the raw input looks truncated (ended mid-string, unbalanced
+/// braces, huge payload), tell the model so it retries with smaller output
+/// instead of repeatedly fighting `max_tokens`.
+fn format_tool_input_parse_error(
+    tool_name: &str,
+    input: &str,
+    error: &serde_json::Error,
+) -> String {
+    let truncated = looks_like_truncated_json(input);
+    let err_text = error.to_string();
+    let hits_eof = err_text.contains("EOF while parsing") || err_text.contains("unexpected end");
+    if truncated || hits_eof {
+        format!(
+            "invalid tool input JSON for `{tool_name}`: {err_text}. \
+             The arguments payload is {} bytes and appears truncated — \
+             the model's response likely hit its output-token limit before \
+             closing the JSON. Retry with a smaller argument. For large \
+             `write_file` payloads, split the file into several chunks and \
+             send them with `append: true` on every call after the first \
+             (first call writes the head; each subsequent call appends the \
+             next chunk). Alternatively, use `edit_file` with a targeted \
+             diff instead of resending the whole file.",
+            input.len()
+        )
+    } else {
+        format!("invalid tool input JSON for `{tool_name}`: {err_text}")
+    }
+}
+
+fn looks_like_truncated_json(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed.ends_with('}') && !trimmed.ends_with(']') {
+        return true;
+    }
+    let mut depth_obj: i32 = 0;
+    let mut depth_arr: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth_obj += 1,
+            '}' => depth_obj -= 1,
+            '[' => depth_arr += 1,
+            ']' => depth_arr -= 1,
+            _ => {}
+        }
+    }
+    in_string || depth_obj != 0 || depth_arr != 0
 }
 
 /// Tools whose execution is purely read-only (no FS mutation, no arbitrary
@@ -8780,15 +8873,16 @@ mod tests {
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_usage_report, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        format_issue_report, format_model_output_cap_warning, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_input_parse_error, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message, format_usage_report,
+        format_user_visible_api_error, looks_like_truncated_json, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
@@ -8818,6 +8912,74 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    #[test]
+    fn looks_like_truncated_json_detects_common_truncations() {
+        assert!(!looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hi"}"#
+        ));
+        assert!(!looks_like_truncated_json(r#"[]"#));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hello"#
+        ));
+        assert!(looks_like_truncated_json(r#"{"path":"a.rs"#));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hi"}x"#
+        ));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"escaped \"quote\""#
+        ));
+    }
+
+    #[test]
+    fn tool_input_parse_error_suggests_split_on_truncation() {
+        let truncated: String = format!("{{\"content\":\"{}", "a".repeat(4000));
+        let err: serde_json::Error = serde_json::from_str::<serde_json::Value>(&truncated)
+            .err()
+            .expect("should fail");
+        let message = format_tool_input_parse_error("write_file", &truncated, &err);
+        assert!(message.contains("appears truncated"));
+        assert!(message.contains("split"));
+        assert!(message.contains("write_file"));
+    }
+
+    #[test]
+    fn model_output_cap_warning_fires_for_low_cap_models_only() {
+        // Low-cap families — banner MUST fire so the user knows big writes
+        // will hit the provider's output-token ceiling.
+        assert!(format_model_output_cap_warning("deepseek-chat").is_some());
+        assert!(format_model_output_cap_warning("deepseek-reasoner").is_some());
+        assert!(format_model_output_cap_warning("gpt-4-turbo").is_some());
+        assert!(format_model_output_cap_warning("gpt-3.5-turbo").is_some());
+        assert!(format_model_output_cap_warning("gemini-1.5-flash").is_some());
+        assert!(format_model_output_cap_warning("gemini-1.5-pro").is_some());
+        assert!(format_model_output_cap_warning("gemini-2.0-flash").is_some());
+        assert!(format_model_output_cap_warning("qwen-max").is_some());
+        assert!(format_model_output_cap_warning("qwen-turbo").is_some());
+        // High-cap models — no banner.
+        assert!(format_model_output_cap_warning("claude-sonnet-4-6").is_none());
+        assert!(format_model_output_cap_warning("claude-opus-4-6").is_none());
+        assert!(format_model_output_cap_warning("grok-3").is_none());
+        assert!(format_model_output_cap_warning("gemini-2.5-pro").is_none());
+        assert!(format_model_output_cap_warning("gpt-4.1").is_none());
+        // Unknown model — banner relies on registry data, so no warning.
+        assert!(format_model_output_cap_warning("totally-unknown-model").is_none());
+
+        let warning = format_model_output_cap_warning("deepseek-chat").expect("warning");
+        assert!(warning.contains("8192"));
+        assert!(warning.contains("deepseek-chat"));
+    }
+
+    #[test]
+    fn tool_input_parse_error_stays_terse_on_normal_errors() {
+        let garbage = "{not json}";
+        let err = serde_json::from_str::<serde_json::Value>(garbage)
+            .err()
+            .expect("should fail");
+        let message = format_tool_input_parse_error("Read", garbage, &err);
+        assert!(!message.contains("appears truncated"));
+        assert!(message.starts_with("invalid tool input JSON"));
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(

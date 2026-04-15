@@ -562,8 +562,7 @@ where
                     .all(|(_, name, _)| self.tool_executor.is_parallelizable(name));
 
             if parallel_candidate {
-                let batch =
-                    self.prepare_parallel_batch(&mut pending_tool_uses, iterations)?;
+                let batch = self.prepare_parallel_batch(&mut pending_tool_uses, iterations)?;
                 // Phase B1 — dispatch: chunk the batch so at most
                 // `MAX_PARALLEL_TOOL_THREADS` threads run concurrently,
                 // preventing nested-threadpool thrashing (e.g. ripgrep).
@@ -626,12 +625,9 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
-                            self.tool_executor.emit_result(&tool_name, &output, is_error);
-                            output = merge_hook_feedback(
-                                pre_hook_result.messages(),
-                                output,
-                                false,
-                            );
+                            self.tool_executor
+                                .emit_result(&tool_name, &output, is_error);
+                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
                             let post_hook_result = if is_error {
                                 self.run_post_tool_use_failure_hook(
                                     &tool_name,

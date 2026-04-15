@@ -169,7 +169,7 @@ impl OpenAiCompatClient {
             ..request.clone()
         };
         preflight_message_request(&request)?;
-        let response = self.send_with_retry(&request).await?;
+        let (response, effective_request) = self.send_with_max_tokens_adaptation(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -187,28 +187,99 @@ impl OpenAiCompatClient {
                     .get("code")
                     .and_then(serde_json::Value::as_u64)
                     .map(|c| c as u16);
-                return Err(ApiError::Api {
-                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
-                    error_type: err_obj
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_owned),
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+                let error_type = err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned);
+                // Some OpenAI-compat providers wrap a max_tokens-exceeded
+                // error inside a 200-OK body (see DeepSeek on certain
+                // proxy paths). Route it through the same adaptive
+                // downgrade loop so the user still gets a retry.
+                let surfaced = ApiError::Api {
+                    status,
+                    error_type,
                     message: Some(msg),
-                    request_id,
-                    body,
+                    request_id: request_id.clone(),
+                    body: body.clone(),
                     retryable: false,
-                });
+                };
+                if surfaced.is_max_tokens_exceeded() && effective_request.max_tokens > 1024 {
+                    let downgraded = super::downgrade_max_tokens_for_retry(
+                        &effective_request.model,
+                        effective_request.max_tokens,
+                    );
+                    if downgraded < effective_request.max_tokens {
+                        let adjusted = MessageRequest {
+                            max_tokens: downgraded,
+                            ..effective_request.clone()
+                        };
+                        let response = self.send_with_retry(&adjusted).await?;
+                        let request_id = request_id_from_headers(response.headers());
+                        let body = response.text().await.map_err(ApiError::from)?;
+                        let payload = serde_json::from_str::<ChatCompletionResponse>(&body)
+                            .map_err(|error| {
+                                ApiError::json_deserialize(
+                                    self.config.provider_name,
+                                    &adjusted.model,
+                                    &body,
+                                    error,
+                                )
+                            })?;
+                        let mut normalized = normalize_response(&adjusted.model, payload)?;
+                        if normalized.request_id.is_none() {
+                            normalized.request_id = request_id;
+                        }
+                        return Ok(normalized);
+                    }
+                }
+                return Err(surfaced);
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+            ApiError::json_deserialize(
+                self.config.provider_name,
+                &effective_request.model,
+                &body,
+                error,
+            )
         })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = normalize_response(&effective_request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
         Ok(normalized)
+    }
+
+    /// Wrap `send_with_retry` with a one-shot max_tokens downgrade: if
+    /// the provider rejects the request because it asked for too many
+    /// output tokens, compute a safe cap via
+    /// [`super::downgrade_max_tokens_for_retry`] and retry once. Returns
+    /// the response *and* the request that actually produced it, so
+    /// downstream code uses the adjusted model/max_tokens for
+    /// deserialization and telemetry.
+    async fn send_with_max_tokens_adaptation(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<(reqwest::Response, MessageRequest), ApiError> {
+        match self.send_with_retry(request).await {
+            Ok(response) => Ok((response, request.clone())),
+            Err(error) if error.is_max_tokens_exceeded() => {
+                let downgraded =
+                    super::downgrade_max_tokens_for_retry(&request.model, request.max_tokens);
+                if downgraded >= request.max_tokens {
+                    return Err(error);
+                }
+                let adjusted = MessageRequest {
+                    max_tokens: downgraded,
+                    ..request.clone()
+                };
+                let response = self.send_with_retry(&adjusted).await?;
+                Ok((response, adjusted))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn stream_message(
@@ -216,8 +287,9 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         preflight_message_request(request)?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
+        let streaming_request = request.clone().with_streaming();
+        let (response, _) = self
+            .send_with_max_tokens_adaptation(&streaming_request)
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
