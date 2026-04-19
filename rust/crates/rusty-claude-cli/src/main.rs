@@ -24,11 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model,
-    resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model, model_token_limit,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -1170,6 +1170,23 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
     format!("Connected: {model} via {provider}")
+}
+
+/// Surface a one-line advisory when the active model has a small
+/// `max_output_tokens` budget. These caps cause large `write_file` calls to be
+/// cut off mid-JSON, which then fails to parse. The banner warns once so the
+/// user can either switch models or plan to split big edits upfront.
+fn format_model_output_cap_warning(model: &str) -> Option<String> {
+    const LOW_OUTPUT_CAP: u32 = 16_000;
+    let limit = model_token_limit(model)?;
+    if limit.max_output_tokens >= LOW_OUTPUT_CAP {
+        return None;
+    }
+    Some(format!(
+        "\x1b[1;33m⚠\x1b[0m  {model} caps output at {cap} tokens — big write_file payloads may be truncated. \
+         Prefer edit/patch tools for large files, or switch to a higher-capacity model (e.g. /model claude-sonnet-4-6).",
+        cap = limit.max_output_tokens,
+    ))
 }
 
 fn filter_tool_specs(
@@ -2427,12 +2444,17 @@ Usage
 }
 
 fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
-    format!(
+    let mut report = format!(
         "Model updated
   Previous         {previous}
   Current          {next}
   Preserved msgs   {message_count}"
-    )
+    );
+    if let Some(warning) = format_model_output_cap_warning(next) {
+        report.push('\n');
+        report.push_str(&warning);
+    }
+    report
 }
 
 fn format_permissions_report(mode: &str) -> String {
@@ -3163,6 +3185,29 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Collapse `$HOME` in a path to `~` for display.
+fn shorten_home_path(path: &Path) -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    let home = PathBuf::from(home);
+    match path.strip_prefix(&home) {
+        Ok(stripped) if stripped.as_os_str().is_empty() => "~".to_string(),
+        Ok(stripped) => format!("~/{}", stripped.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Fish-style REPL prompt: a rectangular green badge with the current working
+/// directory (Nerd Font folder glyph + `~`-shortened path). Assumes a Nerd
+/// Font is active in the terminal; the folder glyph falls back to a tofu
+/// box without one.
+fn build_repl_prompt() -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let display = shorten_home_path(&cwd);
+    format!("\x1b[1;38;2;33;37;41;48;2;46;164;79m \u{f07b} {display}\x1b[0m ")
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
@@ -3176,13 +3221,19 @@ fn run_repl(
     run_stale_base_preflight(base_commit.as_deref());
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        build_repl_prompt(),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    if let Some(warning) = format_model_output_cap_warning(&cli.model) {
+        println!("{warning}");
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        editor.set_prompt(build_repl_prompt());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -3213,12 +3264,12 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    cli.run_turn_interactive(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.run_turn_interactive(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -3794,13 +3845,13 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[38;5;208m\
+██╗██╗  ██╗  ██████╗██╗      █████╗ ██╗    ██╗\n\
+██║██║ ██╔╝ ██╔════╝██║     ██╔══██╗██║    ██║\n\
+██║█████╔╝  ██║     ██║     ███████║██║ █╗ ██║\n\
+██║██╔═██╗  ██║     ██║     ██╔══██║██║███╗██║\n\
+██║██║  ██╗ ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
+╚═╝╚═╝  ╚═╝  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCODE\x1b[0m 🔥\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -3860,10 +3911,8 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let spinner = ThinkingSpinner::start(
-            "🦀 Thinking...",
-            *TerminalRenderer::new().color_theme(),
-        );
+        let spinner =
+            ThinkingSpinner::start("🔥 Processing", *TerminalRenderer::new().color_theme());
         if let Some(spinner) = spinner.as_ref() {
             runtime
                 .api_client_mut()
@@ -3890,6 +3939,13 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                if error.to_string().contains("turn cancelled by user") {
+                    if let Some(spinner) = spinner {
+                        spinner.finish_failure("🛑 Cancelled");
+                    }
+                    println!("\n\x1b[1;33m⚠️  Turn cancelled — partial progress discarded\x1b[0m");
+                    return Ok(());
+                }
                 if let Some(spinner) = spinner {
                     spinner.finish_failure("❌ Request failed");
                 }
@@ -4364,11 +4420,7 @@ impl LiveCli {
         let tracker = self.runtime.usage();
         println!(
             "{}",
-            format_usage_report(
-                tracker.cumulative_usage(),
-                tracker.turns(),
-                &self.model,
-            )
+            format_usage_report(tracker.cumulative_usage(), tracker.turns(), &self.model,)
         );
     }
 
@@ -4706,6 +4758,94 @@ impl LiveCli {
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
+    }
+
+    /// REPL entrypoint that wraps [`Self::run_turn`] with preemptive compaction
+    /// (Layer 3), catch-and-continue error handling (Layer 1), and an inline
+    /// recovery prompt when the provider rejects the request for exceeding the
+    /// context window (Layer 2). All user-visible errors are printed here so
+    /// the caller can ignore the `Err` path and keep the REPL running.
+    fn run_turn_interactive(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.maybe_auto_compact();
+        match self.run_turn(input) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let err_ref: &(dyn std::error::Error + 'static) = error.as_ref();
+                if is_context_window_blocked(err_ref) {
+                    eprintln!("{error}");
+                    self.handle_context_window_recovery(input)
+                } else {
+                    eprintln!("{error}");
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn maybe_auto_compact(&mut self) {
+        let Some(limit) = model_token_limit(&self.model) else {
+            return;
+        };
+        if limit.context_window_tokens == 0 {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let window = f64::from(limit.context_window_tokens);
+        #[allow(clippy::cast_precision_loss)]
+        let estimated = self.runtime.estimated_tokens() as f64;
+        let ratio = estimated / window;
+        let threshold = f64::from(load_auto_compact_threshold());
+        if ratio < threshold {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let percent = (ratio * 100.0).round() as u32;
+        println!(
+            "🧹 Auto-compacting session ({percent}% of {window_int}-token context window)",
+            window_int = limit.context_window_tokens,
+        );
+        if let Err(error) = self.compact() {
+            eprintln!("warning: auto-compact failed: {error}");
+        }
+    }
+
+    fn handle_context_window_recovery(
+        &mut self,
+        input: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        loop {
+            print!("\nRecovery: [c]ompact & retry / [r]etry / [n]ew session / [q]uit prompt > ");
+            std::io::stdout().flush().ok();
+            let mut choice = String::new();
+            if std::io::stdin().read_line(&mut choice).is_err() {
+                return Ok(());
+            }
+            let trimmed = choice.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "c" | "compact" | "" => {
+                    self.compact()?;
+                    if let Err(error) = self.run_turn(input) {
+                        eprintln!("{error}");
+                    }
+                    return Ok(());
+                }
+                "r" | "retry" => {
+                    if let Err(error) = self.run_turn(input) {
+                        eprintln!("{error}");
+                    }
+                    return Ok(());
+                }
+                "n" | "new" => {
+                    self.clear_session(true)?;
+                    return Ok(());
+                }
+                "q" | "quit" => return Ok(()),
+                _ => {
+                    eprintln!("Unknown choice '{trimmed}'. Use c / r / n / q.");
+                }
+            }
+        }
     }
 
     fn run_internal_prompt_text_with_progress(
@@ -7038,6 +7178,9 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut pending_text_buf = String::new();
+        let mut last_text_flush = Instant::now();
+        const TEXT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -7092,9 +7235,16 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                pending_text_buf.push_str(&rendered);
+                                if pending_text_buf.contains('\n')
+                                    || last_text_flush.elapsed() >= TEXT_FLUSH_INTERVAL
+                                {
+                                    write!(out, "{pending_text_buf}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    pending_text_buf.clear();
+                                    last_text_flush = Instant::now();
+                                }
                             }
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -7114,6 +7264,13 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
+                    if !pending_text_buf.is_empty() {
+                        write!(out, "{pending_text_buf}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        pending_text_buf.clear();
+                        last_text_flush = Instant::now();
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
@@ -7141,6 +7298,12 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
+                    if !pending_text_buf.is_empty() {
+                        write!(out, "{pending_text_buf}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        pending_text_buf.clear();
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         let needs_newline = !rendered.ends_with('\n');
                         write!(out, "{rendered}")
@@ -7155,6 +7318,13 @@ impl AnthropicRuntimeClient {
                     events.push(AssistantEvent::MessageStop);
                 }
             }
+        }
+
+        if !pending_text_buf.is_empty() {
+            write!(out, "{pending_text_buf}")
+                .and_then(|()| out.flush())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            pending_text_buf.clear();
         }
 
         push_prompt_cache_record(&self.client, &mut events);
@@ -7198,6 +7368,42 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .messages
         .last()
         .is_some_and(|message| message.role == MessageRole::Tool)
+}
+
+/// Returns true when the error carries the header emitted by
+/// [`format_context_window_blocked_error`]. Detection is string-based because
+/// context-window failures are flattened into `RuntimeError`'s opaque message
+/// before reaching the REPL — the header is the only reliable signal.
+fn is_context_window_blocked(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.to_string().contains("Context window blocked")
+}
+
+/// Ratio of the model's context window at which the interactive REPL
+/// preemptively compacts the session. Overridable via
+/// `auto_compact_threshold_percent` (integer 1..=100) in `~/.claw.json` or any
+/// merged claw config; values outside that range fall back to the default.
+fn load_auto_compact_threshold() -> f32 {
+    const DEFAULT_THRESHOLD: f32 = 0.8;
+    let Ok(cwd) = env::current_dir() else {
+        return DEFAULT_THRESHOLD;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else {
+        return DEFAULT_THRESHOLD;
+    };
+    let Some(raw) = config
+        .get("auto_compact_threshold_percent")
+        .and_then(|value| value.as_i64())
+    else {
+        return DEFAULT_THRESHOLD;
+    };
+    if (1..=100).contains(&raw) {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = raw as f32 / 100.0;
+        ratio
+    } else {
+        DEFAULT_THRESHOLD
+    }
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -7565,11 +7771,23 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
-    let detail = match name {
-        "bash" | "Bash" => format_bash_call(&parsed),
+    let mut extra_lines: Option<String> = None;
+    let (display_name, detail) = match name {
+        "bash" | "Bash" => {
+            let command = parsed
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let body = if command.is_empty() {
+                String::new()
+            } else {
+                format!("$ {}", truncate_for_summary(command, 160))
+            };
+            ("bash", body)
+        }
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            ("read_file", format!("📄 {path}"))
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -7577,7 +7795,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+            ("write_file", format!("✏️ {path} ({lines} lines)"))
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -7591,27 +7809,45 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .or_else(|| parsed.get("newString"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
-                format_patch_preview(old_value, new_value, &path)
-                    .map(|preview| format!("\n{preview}"))
-                    .unwrap_or_default()
-            )
+            extra_lines = format_patch_preview(old_value, new_value, &path);
+            ("edit_file", format!("📝 {path}"))
         }
-        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
-        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
-        "web_search" | "WebSearch" => parsed
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?")
-            .to_string(),
-        _ => summarize_tool_payload(input),
+        "glob_search" | "Glob" => ("glob_search", format_search_inline("🔎 Glob", &parsed)),
+        "grep_search" | "Grep" => ("grep_search", format_search_inline("🔎 Grep", &parsed)),
+        "web_search" | "WebSearch" => {
+            let query = parsed
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            ("web_search", format!("🔎 {query}"))
+        }
+        other => (other, summarize_tool_payload(input)),
     };
 
-    let border = "─".repeat(name.len() + 8);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    )
+    let mut line = if detail.is_empty() {
+        format!("\x1b[1;38;2;33;37;41;48;2;46;164;79m {display_name} \x1b[0m")
+    } else {
+        format!(
+            "\x1b[1;38;2;33;37;41;48;2;46;164;79m {display_name} \x1b[0m \x1b[97m{detail}\x1b[0m"
+        )
+    };
+    if let Some(preview) = extra_lines {
+        line.push('\n');
+        line.push_str(&preview);
+    }
+    line
+}
+
+fn format_search_inline(label: &str, parsed: &serde_json::Value) -> String {
+    let pattern = parsed
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let scope = parsed
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or(".");
+    format!("{label} {pattern} (in {scope})")
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
@@ -7657,18 +7893,6 @@ fn extract_tool_path(parsed: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("?")
         .to_string()
-}
-
-fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
-    let pattern = parsed
-        .get("pattern")
-        .and_then(|value| value.as_str())
-        .unwrap_or("?");
-    let scope = parsed
-        .get("path")
-        .and_then(|value| value.as_str())
-        .unwrap_or(".");
-    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
 const DIFF_REMOVED_BG: &str = "\x1b[48;5;52m";
@@ -7726,10 +7950,7 @@ fn highlight_diff_line(line: &str, marker: char, bg: &str, language: &str) -> St
         code.push('\n');
         let highlighted = diff_renderer().highlight_code(&code, language);
         highlighted
-            .replace(
-                DIFF_CODE_BLOCK_BG_RESET,
-                &format!("{DIFF_ANSI_RESET}{bg}"),
-            )
+            .replace(DIFF_CODE_BLOCK_BG_RESET, &format!("{DIFF_ANSI_RESET}{bg}"))
             .replace(DIFF_CODE_BLOCK_BG, bg)
             .trim_end_matches('\n')
             .trim_end_matches(DIFF_ANSI_RESET)
@@ -7768,21 +7989,6 @@ fn format_patch_preview(old_value: &str, new_value: &str, path: &str) -> Option<
         rendered.push("\x1b[2m… diff truncated\x1b[0m".to_string());
     }
     Some(rendered.join("\n"))
-}
-
-fn format_bash_call(parsed: &serde_json::Value) -> String {
-    let command = parsed
-        .get("command")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if command.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\x1b[48;5;236;38;5;255m $ {} \x1b[0m",
-            truncate_for_summary(command, 160)
-        )
-    }
 }
 
 fn first_visible_line(text: &str) -> &str {
@@ -8295,8 +8501,8 @@ impl CliToolExecutor {
     }
 }
 
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+impl CliToolExecutor {
+    fn dispatch(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -8306,9 +8512,10 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let value = serde_json::from_str(input).map_err(|error| {
+            ToolError::new(format_tool_input_parse_error(tool_name, input, &error))
+        })?;
+        if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -8316,27 +8523,125 @@ impl ToolExecutor for CliToolExecutor {
             self.tool_registry
                 .execute(tool_name, &value)
                 .map_err(ToolError::new)
-        };
-        match result {
-            Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
-                }
-                Ok(output)
-            }
-            Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                }
-                Err(error)
-            }
         }
+    }
+
+    fn emit_tool_output(&self, tool_name: &str, output: &str, is_error: bool) {
+        if !self.emit_output {
+            return;
+        }
+        let markdown = format_tool_result(tool_name, output, is_error);
+        let _ = self.renderer.stream_markdown(&markdown, &mut io::stdout());
+    }
+}
+
+/// Build an actionable error for a tool call whose argument JSON failed to
+/// parse. When the raw input looks truncated (ended mid-string, unbalanced
+/// braces, huge payload), tell the model so it retries with smaller output
+/// instead of repeatedly fighting `max_tokens`.
+fn format_tool_input_parse_error(
+    tool_name: &str,
+    input: &str,
+    error: &serde_json::Error,
+) -> String {
+    let truncated = looks_like_truncated_json(input);
+    let err_text = error.to_string();
+    let hits_eof = err_text.contains("EOF while parsing") || err_text.contains("unexpected end");
+    if truncated || hits_eof {
+        format!(
+            "invalid tool input JSON for `{tool_name}`: {err_text}. \
+             The arguments payload is {} bytes and appears truncated — \
+             the model's response likely hit its output-token limit before \
+             closing the JSON. Retry with a smaller argument. For large \
+             `write_file` payloads, split the file into several chunks and \
+             send them with `append: true` on every call after the first \
+             (first call writes the head; each subsequent call appends the \
+             next chunk). Alternatively, use `edit_file` with a targeted \
+             diff instead of resending the whole file.",
+            input.len()
+        )
+    } else {
+        format!("invalid tool input JSON for `{tool_name}`: {err_text}")
+    }
+}
+
+fn looks_like_truncated_json(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed.ends_with('}') && !trimmed.ends_with(']') {
+        return true;
+    }
+    let mut depth_obj: i32 = 0;
+    let mut depth_arr: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth_obj += 1,
+            '}' => depth_obj -= 1,
+            '[' => depth_arr += 1,
+            ']' => depth_arr -= 1,
+            _ => {}
+        }
+    }
+    in_string || depth_obj != 0 || depth_arr != 0
+}
+
+/// Tools whose execution is purely read-only (no FS mutation, no arbitrary
+/// subprocess). Parallel batches are only dispatched when every tool in the
+/// batch is listed here.
+fn is_read_only_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Read"
+            | "read_file"
+            | "Grep"
+            | "grep_search"
+            | "Glob"
+            | "glob_search"
+            | "WebFetch"
+            | "WebSearch"
+            | "ToolSearch"
+            | "ListMcpResourcesTool"
+            | "ReadMcpResourceTool"
+    )
+}
+
+impl ToolExecutor for CliToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let result = self.dispatch(tool_name, input);
+        match &result {
+            Ok(output) => self.emit_tool_output(tool_name, output, false),
+            Err(error) => self.emit_tool_output(tool_name, &error.to_string(), true),
+        }
+        result
+    }
+
+    fn is_parallelizable(&self, tool_name: &str) -> bool {
+        is_read_only_tool_name(tool_name)
+    }
+
+    fn execute_shared(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.dispatch(tool_name, input)
+    }
+
+    fn emit_result(&self, tool_name: &str, output: &str, is_error: bool) {
+        self.emit_tool_output(tool_name, output, is_error);
     }
 }
 
@@ -8568,16 +8873,16 @@ mod tests {
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_usage_report,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        format_issue_report, format_model_output_cap_warning, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_input_parse_error, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message, format_usage_report,
+        format_user_visible_api_error, looks_like_truncated_json, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
@@ -8607,6 +8912,74 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    #[test]
+    fn looks_like_truncated_json_detects_common_truncations() {
+        assert!(!looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hi"}"#
+        ));
+        assert!(!looks_like_truncated_json(r#"[]"#));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hello"#
+        ));
+        assert!(looks_like_truncated_json(r#"{"path":"a.rs"#));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"hi"}x"#
+        ));
+        assert!(looks_like_truncated_json(
+            r#"{"path":"a.rs","content":"escaped \"quote\""#
+        ));
+    }
+
+    #[test]
+    fn tool_input_parse_error_suggests_split_on_truncation() {
+        let truncated: String = format!("{{\"content\":\"{}", "a".repeat(4000));
+        let err: serde_json::Error = serde_json::from_str::<serde_json::Value>(&truncated)
+            .err()
+            .expect("should fail");
+        let message = format_tool_input_parse_error("write_file", &truncated, &err);
+        assert!(message.contains("appears truncated"));
+        assert!(message.contains("split"));
+        assert!(message.contains("write_file"));
+    }
+
+    #[test]
+    fn model_output_cap_warning_fires_for_low_cap_models_only() {
+        // Low-cap families — banner MUST fire so the user knows big writes
+        // will hit the provider's output-token ceiling.
+        assert!(format_model_output_cap_warning("deepseek-chat").is_some());
+        assert!(format_model_output_cap_warning("deepseek-reasoner").is_some());
+        assert!(format_model_output_cap_warning("gpt-4-turbo").is_some());
+        assert!(format_model_output_cap_warning("gpt-3.5-turbo").is_some());
+        assert!(format_model_output_cap_warning("gemini-1.5-flash").is_some());
+        assert!(format_model_output_cap_warning("gemini-1.5-pro").is_some());
+        assert!(format_model_output_cap_warning("gemini-2.0-flash").is_some());
+        assert!(format_model_output_cap_warning("qwen-max").is_some());
+        assert!(format_model_output_cap_warning("qwen-turbo").is_some());
+        // High-cap models — no banner.
+        assert!(format_model_output_cap_warning("claude-sonnet-4-6").is_none());
+        assert!(format_model_output_cap_warning("claude-opus-4-6").is_none());
+        assert!(format_model_output_cap_warning("grok-3").is_none());
+        assert!(format_model_output_cap_warning("gemini-2.5-pro").is_none());
+        assert!(format_model_output_cap_warning("gpt-4.1").is_none());
+        // Unknown model — banner relies on registry data, so no warning.
+        assert!(format_model_output_cap_warning("totally-unknown-model").is_none());
+
+        let warning = format_model_output_cap_warning("deepseek-chat").expect("warning");
+        assert!(warning.contains("8192"));
+        assert!(warning.contains("deepseek-chat"));
+    }
+
+    #[test]
+    fn tool_input_parse_error_stays_terse_on_normal_errors() {
+        let garbage = "{not json}";
+        let err = serde_json::from_str::<serde_json::Value>(garbage)
+            .err()
+            .expect("should fail");
+        let message = format_tool_input_parse_error("Read", garbage, &err);
+        assert!(!message.contains("appears truncated"));
+        assert!(message.starts_with("invalid tool input JSON"));
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -12087,11 +12460,19 @@ mod sandbox_report_tests {
             notifier: Some(notifier),
         };
         writer.write_all(b"").expect("empty write ok");
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "empty write must not fire");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "empty write must not fire"
+        );
         writer.write_all(b"hello").expect("first real write ok");
         assert_eq!(counter.load(Ordering::SeqCst), 1, "first write must fire");
         writer.write_all(b"world").expect("second write ok");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "callback must not fire twice");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "callback must not fire twice"
+        );
         drop(writer);
         assert_eq!(&sink, b"helloworld", "all bytes must pass through");
     }

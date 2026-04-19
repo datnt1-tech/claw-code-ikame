@@ -285,7 +285,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_token_limit(model).map_or_else(
+    let base = model_token_limit(model).map_or_else(
         || {
             let canonical = resolve_model_alias(model);
             if canonical.contains("opus") {
@@ -295,7 +295,11 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
             }
         },
         |limit| limit.max_output_tokens,
-    )
+    );
+    // Apply the global env override even for models that didn't match the
+    // registry (model_token_limit already applies it internally, but the
+    // heuristic fallback above bypasses that path).
+    env_max_output_tokens_override().map_or(base, |cap| base.min(cap))
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -309,7 +313,21 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    match canonical.as_str() {
+    let limit = exact_model_token_limit(canonical.as_str())
+        .or_else(|| prefix_model_token_limit(canonical.as_str()));
+    limit.map(|mut lim| {
+        if let Some(cap) = env_max_output_tokens_override() {
+            lim.max_output_tokens = lim.max_output_tokens.min(cap);
+        }
+        lim
+    })
+}
+
+/// Exact-match limits for the specific model revisions we've verified.
+/// Keep conservative: if a provider later raises a cap, add a new entry
+/// rather than guessing here. The prefix fallback catches anything unknown.
+fn exact_model_token_limit(canonical: &str) -> Option<ModelTokenLimit> {
+    match canonical {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
@@ -322,6 +340,10 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "grok-2" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 131_072,
+        }),
         // DeepSeek caps max_tokens at 8192 and provides a 128k context window
         // for both deepseek-chat (V3) and deepseek-reasoner (R1). Requests
         // above 8192 output tokens are rejected with 400 invalid_request_error.
@@ -329,8 +351,206 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
+        "gpt-4o"
+        | "gpt-4o-2024-11-20"
+        | "gpt-4o-2024-08-06"
+        | "gpt-4o-2024-05-13"
+        | "gpt-4o-mini"
+        | "gpt-4o-mini-2024-07-18" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        }),
+        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_047_576,
+        }),
+        "gpt-4-turbo" | "gpt-4-turbo-preview" | "gpt-4-turbo-2024-04-09" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 128_000,
+        }),
+        "gpt-3.5-turbo" | "gpt-3.5-turbo-0125" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 16_385,
+        }),
+        "o1" | "o1-preview" | "o1-2024-12-17" => Some(ModelTokenLimit {
+            max_output_tokens: 100_000,
+            context_window_tokens: 200_000,
+        }),
+        "o1-mini" | "o3-mini" | "o4-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 200_000,
+        }),
+        "o3" => Some(ModelTokenLimit {
+            max_output_tokens: 100_000,
+            context_window_tokens: 200_000,
+        }),
+        "gemini-1.5-pro" | "gemini-1.5-pro-latest" | "gemini-1.5-pro-002" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 8_192,
+                context_window_tokens: 2_000_000,
+            })
+        }
+        "gemini-1.5-flash"
+        | "gemini-1.5-flash-latest"
+        | "gemini-1.5-flash-002"
+        | "gemini-1.5-flash-8b" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_048_576,
+        }),
+        "gemini-2.0-flash" | "gemini-2.0-flash-001" | "gemini-2.0-flash-exp" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 8_192,
+                context_window_tokens: 1_048_576,
+            })
+        }
+        "gemini-2.5-pro" | "gemini-2.5-pro-preview" | "gemini-2.5-pro-exp" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 65_536,
+                context_window_tokens: 2_097_152,
+            })
+        }
+        "gemini-2.5-flash" | "gemini-2.5-flash-preview" | "gemini-2.5-flash-exp" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 65_536,
+                context_window_tokens: 1_048_576,
+            })
+        }
+        "qwen-max" | "qwen-max-latest" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 32_768,
+        }),
+        "qwen-plus" | "qwen-plus-latest" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        "qwen-turbo" | "qwen-turbo-latest" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_000_000,
+        }),
+        "qwen3-coder" | "qwen3-coder-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
         _ => None,
     }
+}
+
+/// Prefix-based fallback so every known model family has sensible caps
+/// without enumerating every revision. Conservative defaults — prefer to
+/// under-estimate max_output than over-estimate (easier to surface the
+/// low-cap warning and trigger auto-downgrade on provider 400 errors).
+fn prefix_model_token_limit(canonical: &str) -> Option<ModelTokenLimit> {
+    if canonical.starts_with("claude-opus") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 200_000,
+        });
+    }
+    if canonical.starts_with("claude-") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        });
+    }
+    if canonical.starts_with("grok-") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        });
+    }
+    if canonical.starts_with("deepseek-") || canonical.starts_with("deepseek/") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        });
+    }
+    if canonical.starts_with("o1-") || canonical.starts_with("o3-") || canonical.starts_with("o4-")
+    {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 200_000,
+        });
+    }
+    if canonical.starts_with("gpt-4o") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        });
+    }
+    if canonical.starts_with("gpt-4.1") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_047_576,
+        });
+    }
+    if canonical.starts_with("gpt-4") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 128_000,
+        });
+    }
+    if canonical.starts_with("gpt-3.5") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 16_385,
+        });
+    }
+    if canonical.starts_with("openai/") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        });
+    }
+    if canonical.starts_with("gemini-2.5") {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
+        });
+    }
+    if canonical.starts_with("gemini-")
+        || canonical.starts_with("gemini/")
+        || canonical.starts_with("google/")
+    {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_048_576,
+        });
+    }
+    if canonical.starts_with("qwen-")
+        || canonical.starts_with("qwen/")
+        || canonical.starts_with("qwen3")
+    {
+        return Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        });
+    }
+    None
+}
+
+/// Reads `CLAW_MAX_OUTPUT_TOKENS` and parses it as a positive u32. Provides
+/// a global override so users can defensively cap output for any model
+/// (e.g. to 4096 when running behind a proxy with its own stricter cap)
+/// without needing a code change or provider-specific config.
+fn env_max_output_tokens_override() -> Option<u32> {
+    std::env::var("CLAW_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+/// Compute a safe `max_tokens` value after a provider rejected the
+/// request because the requested cap exceeds the model's limit. If the
+/// registry knows the real cap, drop to it; otherwise halve the current
+/// request with a 1024-token floor. Never returns 0.
+#[must_use]
+pub fn downgrade_max_tokens_for_retry(model: &str, current_max: u32) -> u32 {
+    if let Some(limit) = model_token_limit(model) {
+        if current_max > limit.max_output_tokens {
+            return limit.max_output_tokens.max(1);
+        }
+    }
+    (current_max / 2).max(1024)
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -518,9 +738,9 @@ mod tests {
 
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        downgrade_max_tokens_for_retry, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -685,6 +905,104 @@ mod tests {
         // then
         assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
         assert_eq!(effective, 32_000);
+    }
+
+    #[test]
+    fn model_token_limit_covers_new_model_families() {
+        let _guard = env_lock();
+        // Clear any stray override so the assertions see the raw caps.
+        let _override = EnvVarGuard::set("CLAW_MAX_OUTPUT_TOKENS", None);
+
+        let gpt4o = model_token_limit("gpt-4o").expect("gpt-4o registered");
+        assert_eq!(gpt4o.max_output_tokens, 16_384);
+        assert_eq!(gpt4o.context_window_tokens, 128_000);
+
+        let turbo = model_token_limit("gpt-4-turbo").expect("gpt-4-turbo registered");
+        assert_eq!(turbo.max_output_tokens, 4_096);
+
+        let gpt41 = model_token_limit("gpt-4.1").expect("gpt-4.1 registered");
+        assert_eq!(gpt41.max_output_tokens, 32_768);
+
+        let flash = model_token_limit("gemini-1.5-flash").expect("gemini-1.5-flash registered");
+        assert_eq!(flash.max_output_tokens, 8_192);
+        assert!(flash.context_window_tokens >= 1_000_000);
+
+        let gem25 = model_token_limit("gemini-2.5-pro").expect("gemini-2.5-pro registered");
+        assert_eq!(gem25.max_output_tokens, 65_536);
+
+        let qwen = model_token_limit("qwen-max").expect("qwen-max registered");
+        assert_eq!(qwen.max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn model_token_limit_falls_back_on_family_prefix() {
+        let _guard = env_lock();
+        let _override = EnvVarGuard::set("CLAW_MAX_OUTPUT_TOKENS", None);
+
+        // Unknown revision should still route through the prefix fallback.
+        let future_sonnet = model_token_limit("claude-sonnet-5-1")
+            .expect("claude- prefix should cover future revs");
+        assert_eq!(future_sonnet.max_output_tokens, 64_000);
+
+        let future_opus = model_token_limit("claude-opus-5")
+            .expect("claude-opus prefix should cover future revs");
+        assert_eq!(future_opus.max_output_tokens, 32_000);
+
+        let openai_ns = model_token_limit("openai/gpt-custom")
+            .expect("openai/ prefix should have a fallback cap");
+        assert_eq!(openai_ns.max_output_tokens, 16_384);
+
+        let gemini_exp = model_token_limit("gemini-3.0-flash-thinking")
+            .expect("gemini- prefix should have a fallback cap");
+        assert_eq!(gemini_exp.max_output_tokens, 8_192);
+
+        let qwen_ns = model_token_limit("qwen/qwen-max-longcontext")
+            .expect("qwen/ prefix should have a fallback cap");
+        assert_eq!(qwen_ns.max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn env_override_caps_max_tokens_for_any_model() {
+        let _guard = env_lock();
+        let _override = EnvVarGuard::set("CLAW_MAX_OUTPUT_TOKENS", Some("2048"));
+
+        // Registered model → env override clamps down.
+        assert_eq!(max_tokens_for_model("claude-opus-4-6"), 2_048);
+        assert_eq!(
+            model_token_limit("claude-opus-4-6")
+                .expect("registered")
+                .max_output_tokens,
+            2_048
+        );
+
+        // DeepSeek's native cap (8192) is already below the override value,
+        // but we still compute min(cap, override) so 8192 stays the ceiling.
+        let _relax = EnvVarGuard::set("CLAW_MAX_OUTPUT_TOKENS", Some("100000"));
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8_192);
+    }
+
+    #[test]
+    fn downgrade_uses_registered_cap_when_request_over_limit() {
+        // DeepSeek hard cap is 8192; a request asking for 64k should be
+        // downgraded to 8192, not halved to 32k.
+        assert_eq!(
+            downgrade_max_tokens_for_retry("deepseek-chat", 64_000),
+            8_192
+        );
+        assert_eq!(downgrade_max_tokens_for_retry("gpt-4-turbo", 16_384), 4_096);
+    }
+
+    #[test]
+    fn downgrade_halves_when_request_already_under_registered_cap() {
+        // Already at or below the registered cap — halve with 1024 floor.
+        assert_eq!(
+            downgrade_max_tokens_for_retry("claude-opus-4-6", 4_096),
+            2_048
+        );
+        assert_eq!(
+            downgrade_max_tokens_for_retry("claude-opus-4-6", 1_500),
+            1_024
+        );
     }
 
     #[test]

@@ -17,6 +17,20 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "request is too large",
 ];
 
+/// Substrings observed in 400/422 error bodies when a provider rejects a
+/// request because `max_tokens`/`max_completion_tokens` is above the
+/// model's output cap. Distinct from context-window errors — these
+/// complain about the *requested output size*, not the prompt size.
+const MAX_TOKENS_ERROR_MARKERS: &[&str] = &[
+    "max_tokens",
+    "max output tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "maximum allowed value",
+    "exceeds the maximum",
+    "output tokens exceed",
+];
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -185,6 +199,47 @@ impl ApiError {
                     || looks_like_generic_fatal_wrapper(body)
             }
             Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. } => false,
+        }
+    }
+
+    /// True when a 400/422 error body indicates the requested
+    /// `max_tokens` is above the model's output cap (DeepSeek's 8192 cap,
+    /// GPT-4-turbo's 4096 cap, etc). Distinct from
+    /// [`is_context_window_failure`] which flags prompt-size errors.
+    /// Used by the provider send loop to auto-downgrade and retry once.
+    #[must_use]
+    pub fn is_max_tokens_exceeded(&self) -> bool {
+        match self {
+            Self::Api {
+                status,
+                message,
+                body,
+                ..
+            } => {
+                if !matches!(status.as_u16(), 400 | 422) {
+                    return false;
+                }
+                let msg = message.as_deref().unwrap_or("");
+                // Context-window errors also surface as 400s and would
+                // otherwise match the "max_tokens" marker via phrases
+                // like "requested N tokens in max_tokens". Exclude them
+                // so we don't trigger a pointless retry.
+                if looks_like_context_window_error(msg) || looks_like_context_window_error(body) {
+                    return false;
+                }
+                looks_like_max_tokens_error(msg) || looks_like_max_tokens_error(body)
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.is_max_tokens_exceeded(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
@@ -373,6 +428,13 @@ fn looks_like_context_window_error(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+fn looks_like_max_tokens_error(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    MAX_TOKENS_ERROR_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
 /// Truncate `body` so the resulting snippet contains at most `max_chars`
 /// characters (counted by Unicode scalar values, not bytes), preserving the
 /// leading slice of the body that the caller most often needs to inspect.
@@ -455,6 +517,72 @@ mod tests {
         let body = "한글한글한글한글한글한글";
         let snippet = truncate_body_snippet(body, 4);
         assert_eq!(snippet, "한글한글…");
+    }
+
+    #[test]
+    fn max_tokens_exceeded_detected_on_deepseek_style_400_error() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model supports max_tokens up to 8192. You requested 32000.".to_string(),
+            ),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+        assert!(error.is_max_tokens_exceeded());
+        assert!(!error.is_context_window_failure());
+    }
+
+    #[test]
+    fn max_tokens_exceeded_detected_on_body_only_error() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: None,
+            request_id: None,
+            body: r#"{"error":{"message":"max_completion_tokens must be <= 16384"}}"#.to_string(),
+            retryable: false,
+        };
+        assert!(error.is_max_tokens_exceeded());
+    }
+
+    #[test]
+    fn max_tokens_exceeded_ignores_context_window_errors() {
+        // Context-window errors ALSO mention token counts — exclude them
+        // so the auto-retry doesn't fire uselessly when the prompt is the
+        // actual problem.
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 128000 tokens. However, you requested 200000 tokens (195000 in the messages, 5000 in max_tokens)."
+                    .to_string(),
+            ),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+        assert!(!error.is_max_tokens_exceeded());
+        assert!(error.is_context_window_failure());
+    }
+
+    #[test]
+    fn max_tokens_exceeded_propagates_through_retries_exhausted() {
+        let inner = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: Some("max_tokens must be <= 8192".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+        let wrapped = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(inner),
+        };
+        assert!(wrapped.is_max_tokens_exceeded());
     }
 
     #[test]

@@ -222,6 +222,18 @@ pub fn read_file(
 
 /// Replaces a file's contents and returns patch metadata.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    write_file_inner(path, content, false)
+}
+
+/// Appends content to an existing file (or creates it when missing) and
+/// returns patch metadata. Intended for chunking large writes across
+/// multiple tool calls when a single payload would exceed the model's
+/// output-token cap.
+pub fn append_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    write_file_inner(path, content, true)
+}
+
+fn write_file_inner(path: &str, content: &str, append: bool) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -238,17 +250,42 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+
+    let final_content = if append {
+        let existing = original_file.clone().unwrap_or_default();
+        let combined_len = existing.len().saturating_add(content.len());
+        if combined_len > MAX_WRITE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "appended content would exceed the {MAX_WRITE_SIZE}-byte cap (existing {} + new {} bytes)",
+                    existing.len(),
+                    content.len(),
+                ),
+            ));
+        }
+        let mut combined = existing;
+        combined.push_str(content);
+        combined
+    } else {
+        content.to_owned()
+    };
+
+    fs::write(&absolute_path, &final_content)?;
+
+    let kind = if append && original_file.is_some() {
+        "append"
+    } else if original_file.is_some() {
+        "update"
+    } else {
+        "create"
+    };
 
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
-            String::from("update")
-        } else {
-            String::from("create")
-        },
+        kind: String::from(kind),
         file_path: absolute_path.to_string_lossy().into_owned(),
-        content: content.to_owned(),
-        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
+        content: final_content.clone(),
+        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), &final_content),
         original_file,
         git_diff: None,
     })
@@ -654,8 +691,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        append_file, edit_file, expand_braces, glob_search, grep_search, is_symlink_escape,
+        read_file, read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -697,6 +734,45 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("binary"));
+    }
+
+    #[test]
+    fn append_file_creates_when_missing_and_appends_to_existing() {
+        let path = temp_path("append.txt");
+        let first = append_file(path.to_string_lossy().as_ref(), "chunk-one\n")
+            .expect("first append should succeed");
+        assert_eq!(first.kind, "create");
+        assert_eq!(first.content, "chunk-one\n");
+
+        let second = append_file(path.to_string_lossy().as_ref(), "chunk-two\n")
+            .expect("second append should succeed");
+        assert_eq!(second.kind, "append");
+        assert_eq!(second.content, "chunk-one\nchunk-two\n");
+
+        let on_disk = std::fs::read_to_string(&path).expect("file should be readable");
+        assert_eq!(on_disk, "chunk-one\nchunk-two\n");
+    }
+
+    #[test]
+    fn write_file_overwrites_by_default() {
+        let path = temp_path("overwrite.txt");
+        write_file(path.to_string_lossy().as_ref(), "first").expect("initial write should succeed");
+        let second = write_file(path.to_string_lossy().as_ref(), "second")
+            .expect("overwrite should succeed");
+        assert_eq!(second.kind, "update");
+        let on_disk = std::fs::read_to_string(&path).expect("file should be readable");
+        assert_eq!(on_disk, "second");
+    }
+
+    #[test]
+    fn append_file_rejects_combined_payload_over_cap() {
+        let path = temp_path("append-cap.txt");
+        let seed = "x".repeat(MAX_WRITE_SIZE - 1);
+        write_file(path.to_string_lossy().as_ref(), &seed).expect("seed write should succeed");
+        let err = append_file(path.to_string_lossy().as_ref(), "yy")
+            .expect_err("append beyond cap should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("cap"));
     }
 
     #[test]

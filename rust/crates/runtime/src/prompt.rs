@@ -1168,7 +1168,10 @@ mod tests {
         assert_eq!(format_model_family("gemini-2.5-pro"), "Gemini 2.5 Pro");
         assert_eq!(format_model_family("gemini-2.5-flash"), "Gemini 2.5 Flash");
         assert_eq!(format_model_family("claude-opus-4-6"), "Claude Opus 4.6");
-        assert_eq!(format_model_family("claude-sonnet-4-5"), "Claude Sonnet 4.5");
+        assert_eq!(
+            format_model_family("claude-sonnet-4-5"),
+            "Claude Sonnet 4.5"
+        );
         assert_eq!(format_model_family("gpt-4o-mini"), "GPT 4o Mini");
         assert_eq!(format_model_family("deepseek-chat"), "DeepSeek Chat");
         assert_eq!(
@@ -1208,11 +1211,7 @@ mod tests {
     fn gemini_config_injects_guidance_section_and_model_family() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        fs::write(
-            root.join(".claw.json"),
-            r#"{"model":"gemini-2.5-pro"}"#,
-        )
-        .expect("write config");
+        fs::write(root.join(".claw.json"), r#"{"model":"gemini-2.5-pro"}"#).expect("write config");
 
         let project_context =
             ProjectContext::discover(&root, "2026-04-10").expect("context should load");
@@ -1236,11 +1235,7 @@ mod tests {
     fn deepseek_config_injects_guidance_section_and_model_family() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        fs::write(
-            root.join(".claw.json"),
-            r#"{"model":"deepseek-chat"}"#,
-        )
-        .expect("write config");
+        fs::write(root.join(".claw.json"), r#"{"model":"deepseek-chat"}"#).expect("write config");
 
         let project_context =
             ProjectContext::discover(&root, "2026-04-10").expect("context should load");
@@ -1263,11 +1258,7 @@ mod tests {
     fn claude_config_omits_working_style_section() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        fs::write(
-            root.join(".claw.json"),
-            r#"{"model":"claude-opus-4-6"}"#,
-        )
-        .expect("write config");
+        fs::write(root.join(".claw.json"), r#"{"model":"claude-opus-4-6"}"#).expect("write config");
 
         let project_context =
             ProjectContext::discover(&root, "2026-04-10").expect("context should load");

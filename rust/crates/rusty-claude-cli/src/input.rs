@@ -122,6 +122,10 @@ impl LineEditor {
         }
     }
 
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+    }
+
     pub fn push_history(&mut self, entry: impl Into<String>) {
         let entry = entry.into();
         if entry.trim().is_empty() {

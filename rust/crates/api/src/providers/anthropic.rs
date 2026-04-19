@@ -297,7 +297,22 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = match self.send_with_retry(&request).await {
+            Ok(response) => response,
+            Err(error) if error.is_max_tokens_exceeded() => {
+                let downgraded_cap =
+                    super::downgrade_max_tokens_for_retry(&request.model, request.max_tokens);
+                if downgraded_cap >= request.max_tokens {
+                    return Err(error);
+                }
+                let adjusted = MessageRequest {
+                    max_tokens: downgraded_cap,
+                    ..request.clone()
+                };
+                self.send_with_retry(&adjusted).await?
+            }
+            Err(error) => return Err(error),
+        };
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
@@ -341,9 +356,25 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let streaming_request = request.clone().with_streaming();
+        let response = match self.send_with_retry(&streaming_request).await {
+            Ok(response) => response,
+            Err(error) if error.is_max_tokens_exceeded() => {
+                let downgraded_cap = super::downgrade_max_tokens_for_retry(
+                    &streaming_request.model,
+                    streaming_request.max_tokens,
+                );
+                if downgraded_cap >= streaming_request.max_tokens {
+                    return Err(error);
+                }
+                let adjusted = MessageRequest {
+                    max_tokens: downgraded_cap,
+                    ..streaming_request.clone()
+                };
+                self.send_with_retry(&adjusted).await?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
