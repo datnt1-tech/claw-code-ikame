@@ -552,6 +552,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
         assert!(error.is_max_tokens_exceeded());
         assert!(!error.is_context_window_failure());
@@ -566,6 +567,7 @@ mod tests {
             request_id: None,
             body: r#"{"error":{"message":"max_completion_tokens must be <= 16384"}}"#.to_string(),
             retryable: false,
+            suggested_action: None,
         };
         assert!(error.is_max_tokens_exceeded());
     }
@@ -585,6 +587,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
         assert!(!error.is_max_tokens_exceeded());
         assert!(error.is_context_window_failure());
@@ -599,6 +602,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
         let wrapped = ApiError::RetriesExhausted {
             attempts: 3,

@@ -241,6 +241,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
         });
     }
+    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
+    // Routes kimi/* and kimi-* model names to DashScope endpoint.
+    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
     // Google Generative AI / Gemini family. Routes any model name with a
     // gemini-/google/-style prefix to the native Gemini REST backend so users
     // can point GEMINI_BASE_URL at the official endpoint or any compatible
@@ -254,16 +264,6 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "GEMINI_API_KEY",
             base_url_env: "GEMINI_BASE_URL",
             default_base_url: google_genai::DEFAULT_BASE_URL,
-        });
-    }
-    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
-    // Routes kimi/* and kimi-* model names to DashScope endpoint.
-    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
     None
@@ -1151,14 +1151,14 @@ mod tests {
     #[test]
     fn returns_context_window_metadata_for_kimi_models() {
         // kimi-k2.5
-        let k25_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have token limit metadata");
+        let k25_limit =
+            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
         assert_eq!(k25_limit.max_output_tokens, 16_384);
         assert_eq!(k25_limit.context_window_tokens, 256_000);
 
         // kimi-k1.5
-        let k15_limit = model_token_limit("kimi-k1.5")
-            .expect("kimi-k1.5 should have token limit metadata");
+        let k15_limit =
+            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
         assert_eq!(k15_limit.max_output_tokens, 16_384);
         assert_eq!(k15_limit.context_window_tokens, 256_000);
     }
@@ -1166,11 +1166,13 @@ mod tests {
     #[test]
     fn kimi_alias_resolves_to_kimi_k25_token_limits() {
         // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit = model_token_limit("kimi")
-            .expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have limits");
-        assert_eq!(alias_limit.max_output_tokens, direct_limit.max_output_tokens);
+        let alias_limit =
+            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
+        assert_eq!(
+            alias_limit.max_output_tokens,
+            direct_limit.max_output_tokens
+        );
         assert_eq!(
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens

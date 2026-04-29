@@ -225,8 +225,10 @@ fn main() {
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
             if message.contains("`claw --help`") {
-                eprintln!("[error-kind: {kind}]
-error: {message}");
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}"
+                );
             } else {
                 eprintln!(
                     "[error-kind: {kind}]
@@ -370,7 +372,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model_flag_raw,
             permission_mode,
             output_format,
-        } => print_status_snapshot(&model, model_flag_raw.as_deref(), permission_mode, output_format)?,
+            allowed_tools,
+        } => print_status_snapshot(
+            &model,
+            model_flag_raw.as_deref(),
+            permission_mode,
+            output_format,
+            allowed_tools.as_ref(),
+        )?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -410,19 +419,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Config {
             section,
             output_format,
-        } => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", render_config_report(section.as_deref())?);
-                }
-                CliOutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
-                    );
-                }
+        } => match output_format {
+            CliOutputFormat::Text => {
+                println!("{}", render_config_report(section.as_deref())?);
             }
-        }
+            CliOutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
+                );
+            }
+        },
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -508,6 +515,7 @@ enum CliAction {
         model_flag_raw: Option<String>,
         permission_mode: PermissionMode,
         output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
     },
     Sandbox {
         output_format: CliOutputFormat,
@@ -605,7 +613,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // to match DEFAULT_MODEL) is still recognised as user-supplied. The
     // env/config fallback only applies when the user did NOT pass --model.
     let mut explicit_model: Option<String> = None;
-    let mut model = DEFAULT_MODEL.to_string();
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
@@ -629,13 +636,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--help" | "-h"
                 if !rest.is_empty()
-                    && matches!(
-                        rest[0].as_str(),
-                        "prompt"
-                            | "commit"
-                            | "pr"
-                            | "issue"
-                    ) =>
+                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
                 // the arg to the API (e.g. `claw prompt --help`) should show
@@ -658,15 +659,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .ok_or_else(|| "missing value for --model".to_string())?;
                 validate_model_syntax(value)?;
                 explicit_model = Some(resolve_model_alias_with_config(value));
-                model = resolve_model_alias_with_config(value);
                 model_flag_raw = Some(value.clone()); // #148
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
                 let value = &flag[8..];
                 validate_model_syntax(value)?;
-                explicit_model = Some(resolve_model_alias_with_config(&flag[8..]));
-                model = resolve_model_alias_with_config(value);
+                explicit_model = Some(resolve_model_alias_with_config(value));
                 model_flag_raw = Some(value.to_string()); // #148
                 index += 1;
             }
@@ -852,9 +851,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, model_flag_raw.as_deref(), permission_mode_override, output_format)
-    {
+    if let Some(action) = parse_single_word_command_alias(
+        &rest,
+        &model,
+        model_flag_raw.as_deref(),
+        permission_mode_override,
+        output_format,
+        allowed_tools.clone(),
+    ) {
         return action;
     }
 
@@ -1059,6 +1063,7 @@ fn parse_single_word_command_alias(
     model_flag_raw: Option<&str>,
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
 ) -> Option<Result<CliAction, String>> {
     if rest.is_empty() {
         return None;
@@ -1103,6 +1108,7 @@ fn parse_single_word_command_alias(
             model_flag_raw: model_flag_raw.map(str::to_string), // #148
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
             output_format,
+            allowed_tools,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
@@ -1320,7 +1326,6 @@ fn suggest_closest_term<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'
     ranked_suggestions(input, candidates).into_iter().next()
 }
 
-
 fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
     const KNOWN_SUBCOMMANDS: &[&str] = &[
         "help",
@@ -1350,8 +1355,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
             let prefix_match = common_prefix_len(&normalized_input, &normalized_candidate) >= 4;
             let substring_match = normalized_candidate.contains(&normalized_input)
                 || normalized_input.contains(&normalized_candidate);
-            ((distance <= 2) || prefix_match || substring_match)
-                .then_some((distance, *candidate))
+            ((distance <= 2) || prefix_match || substring_match).then_some((distance, *candidate))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| left.cmp(right).then_with(|| left.1.cmp(right.1)));
@@ -1370,7 +1374,6 @@ fn common_prefix_len(left: &str, right: &str) -> usize {
         .take_while(|(l, r)| l == r)
         .count()
 }
-
 
 fn looks_like_subcommand_typo(input: &str) -> bool {
     !input.is_empty()
@@ -1478,13 +1481,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             err_msg.push_str("\nDid you mean `openai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
-        }
-        else if trimmed.starts_with("qwen") {
+        } else if trimmed.starts_with("qwen") {
             err_msg.push_str("\nDid you mean `qwen/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
-        }
-        else if trimmed.starts_with("grok") {
+        } else if trimmed.starts_with("grok") {
             err_msg.push_str("\nDid you mean `xai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires XAI_API_KEY env var)");
@@ -3362,6 +3363,7 @@ fn run_resume_command(
                     default_permission_mode().as_str(),
                     &context,
                     None, // #148: resumed sessions don't have flag provenance
+                    None,
                 )),
             })
         }
@@ -4497,7 +4499,6 @@ impl LiveCli {
         println!("{final_text}");
         Ok(())
     }
-
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
@@ -5692,6 +5693,7 @@ fn print_status_snapshot(
     model_flag_raw: Option<&str>,
     permission_mode: PermissionMode,
     output_format: CliOutputFormat,
+    allowed_tools: Option<&AllowedToolSet>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let usage = StatusUsage {
         message_count: 0,
@@ -5715,7 +5717,13 @@ fn print_status_snapshot(
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(&provenance.resolved, usage, permission_mode.as_str(), &context, Some(&provenance))
+            format_status_report(
+                &provenance.resolved,
+                usage,
+                permission_mode.as_str(),
+                &context,
+                Some(&provenance)
+            )
         ),
         CliOutputFormat::Json => println!(
             "{}",
@@ -5725,6 +5733,7 @@ fn print_status_snapshot(
                 permission_mode.as_str(),
                 &context,
                 Some(&provenance),
+                allowed_tools,
             ))?
         ),
     }
@@ -5742,6 +5751,7 @@ fn status_json_value(
     // that don't have provenance (legacy resume paths) pass None, in which
     // case both new fields are omitted.
     provenance: Option<&ModelProvenance>,
+    allowed_tools: Option<&AllowedToolSet>,
 ) -> serde_json::Value {
     // #143: top-level `status` marker so claws can distinguish
     // a clean run from a degraded run (config parse failed but other fields
@@ -5751,6 +5761,7 @@ fn status_json_value(
     let degraded = context.config_load_error.is_some();
     let model_source = provenance.map(|p| p.source.as_str());
     let model_raw = provenance.and_then(|p| p.raw.clone());
+    let allowed_tool_entries = allowed_tools.map(|tools| tools.iter().cloned().collect::<Vec<_>>());
     json!({
         "kind": "status",
         "status": if degraded { "degraded" } else { "ok" },
@@ -5759,6 +5770,11 @@ fn status_json_value(
         "model_source": model_source,
         "model_raw": model_raw,
         "permission_mode": permission_mode,
+        "allowed_tools": {
+            "source": if allowed_tools.is_some() { "flag" } else { "default" },
+            "restricted": allowed_tools.is_some(),
+            "entries": allowed_tool_entries,
+        },
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
@@ -9531,6 +9547,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
+        .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
         .map(|spec| match spec.argument_hint {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
@@ -9604,27 +9621,26 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_output_cap_warning, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_input_parse_error, format_tool_result, format_ultraplan_report,
-        format_unknown_slash_command, format_unknown_slash_command_message, format_usage_report,
-        format_user_visible_api_error, classify_error_kind,
-        looks_like_truncated_json, merge_prompt_with_stdin,
-        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report,
-        split_error_hint,
-        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
+        classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_output_cap_warning,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_input_parse_error,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        format_unknown_slash_command_message, format_usage_report, format_user_visible_api_error,
+        looks_like_truncated_json, merge_prompt_with_stdin, normalize_permission_mode, parse_args,
+        parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
+        render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
@@ -10476,6 +10492,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_allowed_tools_flag() {
+        for raw in ["", ",,"] {
+            let error = parse_args(&["--allowedTools".to_string(), raw.to_string()])
+                .expect_err("empty allowedTools should be rejected");
+            assert!(
+                error.contains("--allowedTools was provided with no usable tool names"),
+                "unexpected error for {raw:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_system_prompt_options() {
         let args = vec![
             "system-prompt".to_string(),
@@ -10674,8 +10702,8 @@ mod tests {
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
         // credentials" error or burn API tokens on an empty prompt).
-        let empty_err = parse_args(&["".to_string()])
-            .expect_err("empty positional arg should be rejected");
+        let empty_err =
+            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
         assert!(
             empty_err.starts_with("empty prompt:"),
             "empty-arg error should be specific, got: {empty_err}"
@@ -10892,7 +10920,8 @@ mod tests {
         .expect("write malformed .claw.json");
 
         let context = with_current_dir(&cwd, || {
-            super::status_context(None).expect("status_context should not hard-fail on config parse errors (#143)")
+            super::status_context(None)
+                .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
         // Phase 1 contract: config_load_error is populated with the parse error.
@@ -10929,7 +10958,14 @@ mod tests {
             cumulative: runtime::TokenUsage::default(),
             estimated_tokens: 0,
         };
-        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
+        let json = super::status_json_value(
+            Some("test-model"),
+            usage,
+            "workspace-write",
+            &context,
+            None,
+            None,
+        );
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
             Some("degraded"),
@@ -10946,8 +10982,54 @@ mod tests {
             json.get("model").and_then(|v| v.as_str()),
             Some("test-model")
         );
-        assert!(json.get("workspace").is_some(), "workspace field still reported");
-        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
+        assert!(
+            json.get("workspace").is_some(),
+            "workspace field still reported"
+        );
+        assert!(
+            json.get("sandbox").is_some(),
+            "sandbox field still reported"
+        );
+        assert_eq!(
+            json.pointer("/allowed_tools/source")
+                .and_then(|v| v.as_str()),
+            Some("default"),
+            "default status should expose unrestricted tool source: {json}"
+        );
+        assert_eq!(
+            json.pointer("/allowed_tools/restricted")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "default status should expose unrestricted tool state: {json}"
+        );
+
+        let allowed: super::AllowedToolSet = ["read_file", "grep_search"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let restricted_json = super::status_json_value(
+            Some("test-model"),
+            usage,
+            "workspace-write",
+            &context,
+            None,
+            Some(&allowed),
+        );
+        assert_eq!(
+            restricted_json
+                .pointer("/allowed_tools/source")
+                .and_then(|v| v.as_str()),
+            Some("flag"),
+            "flag status should expose allow-list source: {restricted_json}"
+        );
+        assert_eq!(
+            restricted_json
+                .pointer("/allowed_tools/entries")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2),
+            "flag status should expose allow-list entries: {restricted_json}"
+        );
 
         // Clean path: no config error → status: "ok", config_load_error: null.
         let clean_cwd = root.join("project-with-clean-config");
@@ -10956,8 +11038,14 @@ mod tests {
             super::status_context(None).expect("clean status_context should succeed")
         });
         assert!(clean_context.config_load_error.is_none());
-        let clean_json =
-            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context, None);
+        let clean_json = super::status_json_value(
+            Some("test-model"),
+            usage,
+            "workspace-write",
+            &clean_context,
+            None,
+            None,
+        );
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
             Some("ok"),
@@ -11034,6 +11122,7 @@ mod tests {
                 model_flag_raw: None, // #148: no --model flag passed
                 permission_mode: PermissionMode::DangerFullAccess,
                 output_format: CliOutputFormat::Text,
+                allowed_tools: None,
             }
         );
         assert_eq!(
@@ -11056,11 +11145,18 @@ mod tests {
         // Other unrecognized args should NOT trigger the --json hint.
         let err_other = parse_args(&["doctor".to_string(), "garbage".to_string()])
             .expect_err("`doctor garbage` should fail without --json hint");
-        assert!(!err_other.contains("--output-format json"),
-            "unrelated args should not trigger --json hint: {err_other}");
+        assert!(
+            !err_other.contains("--output-format json"),
+            "unrelated args should not trigger --json hint: {err_other}"
+        );
         // #154: model syntax error should hint at provider prefix when applicable
-        let err_gpt = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "gpt-4".to_string()])
-            .expect_err("`--model gpt-4` should fail with OpenAI hint");
+        let err_gpt = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "gpt-4".to_string(),
+        ])
+        .expect_err("`--model gpt-4` should fail with OpenAI hint");
         assert!(
             err_gpt.contains("Did you mean `openai/gpt-4`?"),
             "GPT model error should hint openai/ prefix: {err_gpt}"
@@ -11069,8 +11165,13 @@ mod tests {
             err_gpt.contains("OPENAI_API_KEY"),
             "GPT model error should mention env var: {err_gpt}"
         );
-        let err_qwen = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "qwen-plus".to_string()])
-            .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        let err_qwen = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "qwen-plus".to_string(),
+        ])
+        .expect_err("`--model qwen-plus` should fail with DashScope hint");
         assert!(
             err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
             "Qwen model error should hint qwen/ prefix: {err_qwen}"
@@ -11080,8 +11181,13 @@ mod tests {
             "Qwen model error should mention env var: {err_qwen}"
         );
         // Unrelated invalid model should NOT get a hint
-        let err_garbage = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "asdfgh".to_string()])
-            .expect_err("`--model asdfgh` should fail");
+        let err_garbage = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "asdfgh".to_string(),
+        ])
+        .expect_err("`--model asdfgh` should fail");
         assert!(
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
@@ -11091,15 +11197,42 @@ mod tests {
     #[test]
     fn classify_error_kind_returns_correct_discriminants() {
         // #77: error kind classification for JSON error payloads
-        assert_eq!(classify_error_kind("missing Anthropic credentials; export ..."), "missing_credentials");
-        assert_eq!(classify_error_kind("no worker state file found at /tmp/..."), "missing_worker_state");
-        assert_eq!(classify_error_kind("session not found: abc123"), "session_not_found");
-        assert_eq!(classify_error_kind("failed to restore session: no managed sessions found"), "session_load_failed");
-        assert_eq!(classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"), "cli_parse");
-        assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
-        assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
-        assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
-        assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+        assert_eq!(
+            classify_error_kind("missing Anthropic credentials; export ..."),
+            "missing_credentials"
+        );
+        assert_eq!(
+            classify_error_kind("no worker state file found at /tmp/..."),
+            "missing_worker_state"
+        );
+        assert_eq!(
+            classify_error_kind("session not found: abc123"),
+            "session_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("failed to restore session: no managed sessions found"),
+            "session_load_failed"
+        );
+        assert_eq!(
+            classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
+            "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
+            "invalid_model_syntax"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported resumed command: /blargh"),
+            "unsupported_resumed_command"
+        );
+        assert_eq!(
+            classify_error_kind("api failed after 3 attempts: ..."),
+            "api_http_error"
+        );
+        assert_eq!(
+            classify_error_kind("something completely unknown"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -11571,7 +11704,6 @@ mod tests {
         assert!(report.contains("Use /help"));
     }
 
-
     #[test]
     fn typoed_doctor_subcommand_returns_did_you_mean_error() {
         let error = parse_args(&["doctorr".to_string()]).expect_err("doctorr should error");
@@ -11653,7 +11785,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
@@ -13606,6 +13737,32 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn stub_commands_absent_from_resume_safe_help() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("resume-safe command line should exist");
+        let resume_roots = resume_line
+            .trim_start_matches("Resume-safe commands:")
+            .split(',')
+            .filter_map(|entry| entry.trim().strip_prefix('/'))
+            .filter_map(|entry| entry.split_whitespace().next())
+            .collect::<Vec<_>>();
+
+        for stub in STUB_COMMANDS {
+            assert!(
+                !resume_roots.contains(stub),
+                "stub command /{stub} should not appear in resume-safe command list"
+            );
+        }
+
+        assert!(resume_roots.contains(&"status"));
     }
 }
 
