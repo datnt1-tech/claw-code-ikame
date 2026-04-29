@@ -260,7 +260,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 
