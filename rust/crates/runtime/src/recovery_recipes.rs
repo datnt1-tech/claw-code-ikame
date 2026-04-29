@@ -45,10 +45,14 @@ impl FailureScenario {
     #[must_use]
     pub fn from_worker_failure_kind(kind: WorkerFailureKind) -> Self {
         match kind {
-            WorkerFailureKind::TrustGate => Self::TrustPromptUnresolved,
+            WorkerFailureKind::TrustGate | WorkerFailureKind::ToolPermissionGate => {
+                Self::TrustPromptUnresolved
+            }
             WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
             WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
-            WorkerFailureKind::Provider => Self::ProviderFailure,
+            WorkerFailureKind::Provider | WorkerFailureKind::StartupNoEvidence => {
+                Self::ProviderFailure
+            }
         }
     }
 }

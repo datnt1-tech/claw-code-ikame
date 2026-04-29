@@ -240,6 +240,13 @@ impl GlobalToolRegistry {
             }
         }
 
+        if allowed.is_empty() {
+            return Err(format!(
+                "--allowedTools was provided with no usable tool names (got `{}`). Omit the flag to allow all tools.",
+                values.join(" ")
+            ));
+        }
+
         Ok(Some(allowed))
     }
 
@@ -4470,6 +4477,7 @@ fn classify_lane_blocker(error: &str) -> LaneEventBlocker {
     LaneEventBlocker {
         failure_class: classify_lane_failure(error),
         detail,
+        subphase: None,
     }
 }
 
@@ -6891,6 +6899,21 @@ mod tests {
         let empty_permission =
             permission_mode_from_plugin("").expect_err("empty plugin permission should fail");
         assert!(empty_permission.contains("unsupported plugin permission: "));
+    }
+
+    #[test]
+    fn allowed_tools_rejects_empty_token_lists() {
+        let registry = GlobalToolRegistry::builtin();
+
+        for raw in ["", ",,", "   "] {
+            let err = registry
+                .normalize_allowed_tools(&[raw.to_string()])
+                .expect_err("empty allow-list input should be rejected");
+            assert!(
+                err.contains("--allowedTools was provided with no usable tool names"),
+                "unexpected error for {raw:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -9620,9 +9643,12 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn run_task_packet_creates_packet_backed_task() {
+        use runtime::task_packet::TaskScope;
         let result = run_task_packet(TaskPacket {
             objective: "Ship packetized runtime task".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Module,
+            scope_path: Some("runtime/task system".to_string()),
+            worktree: Some("/tmp/wt-packet".to_string()),
             repo: "claw-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![

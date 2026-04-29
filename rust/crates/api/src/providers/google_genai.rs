@@ -1007,6 +1007,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable: is_retryable_status(status),
+        suggested_action: None,
     })
 }
 
@@ -1028,6 +1029,7 @@ fn inline_error_response(body: &str, request_id: Option<String>) -> Option<ApiEr
         request_id,
         body: body.to_string(),
         retryable: false,
+        suggested_action: None,
     })
 }
 
