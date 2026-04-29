@@ -619,6 +619,10 @@ fn translate_messages(messages: &[InputMessage]) -> Value {
                         }
                     }));
                 }
+                // Gemini doesn't roundtrip an explicit "thinking" block in
+                // its REST shape — it relies on its own thinking config.
+                // Drop it on the wire while preserving it in the session.
+                InputContentBlock::Thinking { .. } => {}
             }
         }
         if parts.is_empty() {

@@ -92,6 +92,17 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    /// Mirror of [`OutputContentBlock::Thinking`] for echoing the
+    /// assistant's prior chain-of-thought back to the API. DeepSeek-V4
+    /// rejects the next turn with 400 if a previous assistant message
+    /// in the request omits its `reasoning_content`; preserving the
+    /// block here is what lets the OpenAI-compat translator put it back
+    /// on the wire.
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
