@@ -41,6 +41,14 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// Chain-of-thought / reasoning text emitted by thinking-capable
+    /// models (e.g. DeepSeek-V4). Persisted so we can echo it back on
+    /// the next request — DeepSeek-V4 rejects follow-up turns with 400
+    /// when prior assistant messages drop their `reasoning_content`.
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
 }
 
 /// One conversation message with optional token-usage metadata.
@@ -767,6 +775,16 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::Thinking { text, signature } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
+                object.insert("text".to_string(), JsonValue::String(text.clone()));
+                if let Some(sig) = signature {
+                    object.insert("signature".to_string(), JsonValue::String(sig.clone()));
+                }
+            }
         }
         JsonValue::Object(object)
     }
@@ -796,6 +814,13 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                text: required_string(object, "text")?,
+                signature: object
+                    .get("signature")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"

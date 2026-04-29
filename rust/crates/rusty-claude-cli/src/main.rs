@@ -6886,6 +6886,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { text, .. } => {
+                    lines.push(format!("[thinking] {text}"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -7069,6 +7072,13 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
                         lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::Thinking { text, .. } => {
+                    let trimmed = text.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(format!("> _thinking:_ {trimmed}"));
                         lines.push(String::new());
                     }
                 }
@@ -8000,13 +8010,26 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
+                        if !thinking.is_empty() {
+                            events.push(AssistantEvent::ThinkingDelta {
+                                text: thinking,
+                                signature: None,
+                            });
+                        }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        if !signature.is_empty() {
+                            events.push(AssistantEvent::ThinkingDelta {
+                                text: String::new(),
+                                signature: Some(signature),
+                            });
+                        }
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -9097,9 +9120,18 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            // Preserve the chain-of-thought so it can be echoed back on
+            // the next turn (DeepSeek-V4 thinking mode requirement).
+            events.push(AssistantEvent::ThinkingDelta {
+                text: thinking,
+                signature,
+            });
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
@@ -9417,6 +9449,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking { text, signature } => InputContentBlock::Thinking {
+                        thinking: text.clone(),
+                        signature: signature.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

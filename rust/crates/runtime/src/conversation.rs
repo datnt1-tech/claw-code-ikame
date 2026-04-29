@@ -29,6 +29,14 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    /// Chain-of-thought from a thinking-mode model. Accumulated into a
+    /// [`ContentBlock::Thinking`] so it can be roundtripped on the next
+    /// turn — DeepSeek-V4 returns 400 if a follow-up request omits the
+    /// reasoning content from the prior assistant message.
+    ThinkingDelta {
+        text: String,
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -1000,6 +1008,8 @@ fn build_assistant_message(
     RuntimeError,
 > {
     let mut text = String::new();
+    let mut thinking = String::new();
+    let mut thinking_signature: Option<String> = None;
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
@@ -1007,8 +1017,21 @@ fn build_assistant_message(
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
+                text.push_str(&delta);
+            }
+            AssistantEvent::ThinkingDelta {
+                text: chunk,
+                signature,
+            } => {
+                thinking.push_str(&chunk);
+                if signature.is_some() {
+                    thinking_signature = signature;
+                }
+            }
             AssistantEvent::ToolUse { id, name, input } => {
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
@@ -1020,6 +1043,7 @@ fn build_assistant_message(
         }
     }
 
+    flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
     flush_text_block(&mut text, &mut blocks);
 
     if !finished {
@@ -1042,6 +1066,19 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
+        });
+    }
+}
+
+fn flush_thinking_block(
+    thinking: &mut String,
+    signature: &mut Option<String>,
+    blocks: &mut Vec<ContentBlock>,
+) {
+    if !thinking.is_empty() {
+        blocks.push(ContentBlock::Thinking {
+            text: std::mem::take(thinking),
+            signature: signature.take(),
         });
     }
 }

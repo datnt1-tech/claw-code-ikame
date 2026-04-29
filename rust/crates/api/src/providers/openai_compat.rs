@@ -518,6 +518,12 @@ impl OpenAiSseParser {
     }
 }
 
+/// Block index reserved for the synthetic Thinking content block emitted
+/// from `delta.reasoning_content` chunks. Far above any plausible
+/// OpenAI tool_call index (which is `openai_index + 1`), so it cannot
+/// collide with text (index 0) or tool_calls.
+const THINKING_BLOCK_INDEX: u32 = 1_000_000;
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct StreamState {
@@ -525,6 +531,8 @@ struct StreamState {
     message_started: bool,
     text_started: bool,
     text_finished: bool,
+    thinking_started: bool,
+    thinking_finished: bool,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
@@ -538,6 +546,8 @@ impl StreamState {
             message_started: false,
             text_started: false,
             text_finished: false,
+            thinking_started: false,
+            thinking_finished: false,
             finished: false,
             stop_reason: None,
             usage: None,
@@ -579,7 +589,43 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // DeepSeek-Reasoner / DeepSeek-V4 thinking mode streams its
+            // chain-of-thought via `reasoning_content` *before* `content`
+            // (or before tool_calls) starts. Emit it as a Thinking block
+            // so the runtime can persist it and roundtrip it on the
+            // next turn — without the roundtrip, V4 returns 400.
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+            {
+                if !self.thinking_started {
+                    self.thinking_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: THINKING_BLOCK_INDEX,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: THINKING_BLOCK_INDEX,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
+                }));
+            }
+
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                // Close the thinking block before opening the text block
+                // (Anthropic semantics: blocks don't overlap).
+                if self.thinking_started && !self.thinking_finished {
+                    self.thinking_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: THINKING_BLOCK_INDEX,
+                    }));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -595,6 +641,17 @@ impl StreamState {
                 }));
             }
 
+            // Tool calls also follow the thinking phase — close the
+            // thinking block first if it's still open.
+            if !choice.delta.tool_calls.is_empty()
+                && self.thinking_started
+                && !self.thinking_finished
+            {
+                self.thinking_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: THINKING_BLOCK_INDEX,
+                }));
+            }
             for tool_call in choice.delta.tool_calls {
                 let state = self.tool_calls.entry(tool_call.index).or_default();
                 state.apply(tool_call);
@@ -643,6 +700,12 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        if self.thinking_started && !self.thinking_finished {
+            self.thinking_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: THINKING_BLOCK_INDEX,
+            }));
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -775,12 +838,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    /// DeepSeek-Reasoner streams its chain-of-thought here, separate from
-    /// `content`. We accept the field so deserialization succeeds, but drop
-    /// it: the CLI only renders the final answer to keep terminal output
-    /// uncluttered. Surface it later if a debug/verbose mode demands it.
+    /// Chain-of-thought emitted separately from `content` by reasoning
+    /// models (DeepSeek-Reasoner / DeepSeek-V4 thinking mode). Preserved
+    /// in [`normalize_response`] as an `OutputContentBlock::Thinking`
+    /// so it can be echoed back on the next turn — DeepSeek-V4 returns
+    /// 400 if a follow-up request omits it from the prior assistant
+    /// message.
     #[serde(default)]
-    #[allow(dead_code)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
@@ -1081,10 +1145,12 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Thinking { thinking, .. } => reasoning.push_str(thinking),
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -1096,13 +1162,19 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
                 });
+                // DeepSeek-V4 (thinking mode) rejects follow-up turns with
+                // 400 if a prior assistant message in the request omits its
+                // `reasoning_content`. Echo it back when present.
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = json!(reasoning);
+                }
                 // Only include tool_calls when non-empty: some providers reject
                 // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
@@ -1136,7 +1208,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::ToolUse { .. } | InputContentBlock::Thinking { .. } => None,
             })
             .collect(),
     }
@@ -1315,6 +1387,19 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    // Preserve reasoning_content from thinking-mode models (DeepSeek-V4,
+    // etc.) so it can be echoed back on the next turn. Emitting it before
+    // the text block matches the natural ordering (reasoning → answer).
+    if let Some(thinking) = choice
+        .message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -2108,10 +2193,12 @@ mod tests {
     }
 
     #[test]
-    fn streaming_chunk_with_reasoning_content_parses_and_drops_it() {
-        // DeepSeek-Reasoner streams chain-of-thought via `reasoning_content`
-        // before any `content` arrives. We need parsing to succeed; the
-        // reasoning text itself is intentionally not surfaced.
+    fn streaming_chunk_with_reasoning_content_emits_thinking_block_events() {
+        // DeepSeek-Reasoner / DeepSeek-V4 stream chain-of-thought via
+        // `reasoning_content` before any `content` arrives. Verify the
+        // chunk parses cleanly AND that ingest_chunk emits a Thinking
+        // ContentBlockStart + ThinkingDelta so the runtime can persist
+        // and roundtrip it on the next turn.
         let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
             "id": "chatcmpl-1",
             "model": "deepseek-reasoner",
@@ -2129,6 +2216,53 @@ mod tests {
             delta.reasoning_content.as_deref(),
             Some("Let me think step by step...")
         );
+
+        let mut state = super::StreamState::new("deepseek-reasoner".to_string());
+        let events = state.ingest_chunk(chunk).expect("ingest chunk");
+        // MessageStart + ContentBlockStart(Thinking) + ContentBlockDelta(ThinkingDelta)
+        assert_eq!(events.len(), 3, "events: {events:?}");
+        match &events[1] {
+            crate::types::StreamEvent::ContentBlockStart(e) => match &e.content_block {
+                crate::types::OutputContentBlock::Thinking { .. } => {}
+                other => panic!("expected Thinking start, got {other:?}"),
+            },
+            other => panic!("expected ContentBlockStart, got {other:?}"),
+        }
+        match &events[2] {
+            crate::types::StreamEvent::ContentBlockDelta(e) => match &e.delta {
+                crate::types::ContentBlockDelta::ThinkingDelta { thinking } => {
+                    assert_eq!(thinking, "Let me think step by step...");
+                }
+                other => panic!("expected ThinkingDelta, got {other:?}"),
+            },
+            other => panic!("expected ContentBlockDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_message_echoes_assistant_thinking_as_reasoning_content() {
+        // Roundtrip guarantee: when a prior assistant turn carries a
+        // Thinking block, the next OpenAI-compat request body must
+        // include it as `reasoning_content` on that assistant message.
+        // DeepSeek-V4 returns 400 if it's missing.
+        use crate::types::{InputContentBlock, InputMessage};
+        let message = InputMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                InputContentBlock::Thinking {
+                    thinking: "Step 1: ...".to_string(),
+                    signature: None,
+                },
+                InputContentBlock::Text {
+                    text: "Final answer".to_string(),
+                },
+            ],
+        };
+        let translated = super::translate_message(&message, "deepseek-v4-pro");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0]["role"], json!("assistant"));
+        assert_eq!(translated[0]["content"], json!("Final answer"));
+        assert_eq!(translated[0]["reasoning_content"], json!("Step 1: ..."));
     }
 
     // ============================================================================
@@ -2212,7 +2346,11 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_response_with_reasoning_content_parses_and_drops_it() {
+    fn non_streaming_response_preserves_reasoning_content_as_thinking_block() {
+        // DeepSeek-V4 thinking mode requires `reasoning_content` to be
+        // echoed back on the next turn — drop it and the follow-up
+        // request gets a 400. Preserve it as a Thinking block ahead of
+        // the answer so the runtime can roundtrip it.
         let response: super::ChatCompletionResponse = serde_json::from_value(json!({
             "id": "chatcmpl-2",
             "model": "deepseek-reasoner",
@@ -2227,13 +2365,18 @@ mod tests {
         }))
         .expect("parse reasoner response");
         let normalized = normalize_response("deepseek-reasoner", response).expect("normalize");
-        // Only the final answer surfaces — reasoning_content is dropped.
-        assert_eq!(normalized.content.len(), 1);
+        assert_eq!(normalized.content.len(), 2);
         match &normalized.content[0] {
+            crate::types::OutputContentBlock::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "thinking...");
+            }
+            other => panic!("expected thinking block first, got {other:?}"),
+        }
+        match &normalized.content[1] {
             crate::types::OutputContentBlock::Text { text } => {
                 assert_eq!(text, "The answer is 42.");
             }
-            other => panic!("expected text block, got {other:?}"),
+            other => panic!("expected text block second, got {other:?}"),
         }
     }
 
