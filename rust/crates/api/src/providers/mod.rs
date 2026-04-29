@@ -371,6 +371,11 @@ fn exact_model_token_limit(canonical: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
+        // DeepSeek-V4 Pro: 1M context window, 384k max output tokens.
+        "deepseek-v4-pro" => Some(ModelTokenLimit {
+            max_output_tokens: 384_000,
+            context_window_tokens: 1_000_000,
+        }),
         "gpt-4o"
         | "gpt-4o-2024-11-20"
         | "gpt-4o-2024-08-06"

@@ -692,7 +692,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
-            "--dangerously-skip-permissions" => {
+            "--dangerously-skip-permissions" | "--danger-full-access" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
@@ -1562,7 +1562,7 @@ fn default_permission_mode() -> PermissionMode {
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+        .unwrap_or(PermissionMode::WorkspaceWrite)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -9518,7 +9518,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --dangerously-skip-permissions  Skip all permission checks"
+        "  --danger-full-access       Run with full filesystem/network access (alias: --dangerously-skip-permissions)"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
