@@ -48,6 +48,7 @@ const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const DEEPSEEK_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB (same as xAI / mid-range)
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -96,7 +97,7 @@ impl OpenAiCompatConfig {
             api_key_env: "DEEPSEEK_API_KEY",
             base_url_env: "DEEPSEEK_BASE_URL",
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
-            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+            max_request_body_bytes: DEEPSEEK_MAX_REQUEST_BODY_BYTES,
         }
     }
 
